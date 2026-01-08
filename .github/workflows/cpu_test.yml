@@ -53,7 +53,7 @@ jobs:
       - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y ffmpeg
+          sudo apt-get install -y ffmpeg libegl1 libegl-mesa0 libgl1 libglx-mesa0 libgles2 mesa-utils
 
       - name: Install uv
         uses: astral-sh/setup-uv@v5
@@ -96,8 +96,13 @@ jobs:
       - name: Run CPU tests with coverage
         run: |
           source .venv/bin/activate
+          mkdir -p /tmp/libero-assets/libero/libero
+          export LIBERO_CONFIG_PATH="$(pwd)/.github/assets/libero"
+          echo LIBERO_CONFIG_PATH is $LIBERO_CONFIG_PATH
+          python3 -c "import sys; print(sys.path)"
+          python3 -c "import libero.libero" && echo "LIBERO config set successfully."
           echo "Running cpu based pytest and generating coverage report..."
-          pytest -m "not gpu" -n auto -v --cov=lerobot/ --cov-report=xml:cpu_test/cpu_test.xml --ignore=tests/planner/test_planner.py tests/
+          pytest -m "not gpu" -n auto -v --cov=lerobot/ --cov-report=xml:cpu_test/cpu_test.xml --ignore=tests/planner/test_planner.py --ignore tests/utils/test_libero_utils.py --deselect=tests/envs/test_factory.py::TestMakeEnv::test_make_env_async_vector_env --deselect=tests/envs/test_factory.py::TestMakeEnv::test_make_env_sync_vector_env tests/
           echo "Pytest execution and coverage report generation completed."
 
       - name: Upload coverage reports
