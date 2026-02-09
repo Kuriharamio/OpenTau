@@ -247,8 +247,8 @@ DATA_FEATURES_NAME_MAPPING = {
         "response": "response",
     },
     "custom": {
-        "camera0": "observation.wrist_cam",
-        "camera1": "observation.right_cam",
+        "camera0": "observation.front_cam",
+        "camera1": "observation.wrist_cam",
         "state": "observation.state",
         "actions": "action",
         "prompt": "task",
