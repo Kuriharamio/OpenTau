@@ -119,6 +119,16 @@ def update_policy(
 def train(cfg: TrainPipelineConfig):
     cfg.validate()
 
+    if getattr(cfg.policy, "stage2_tactile_finetune", False):
+        if not cfg.resume and cfg.policy.pretrained_path is None:
+            logging.warning(
+                "stage2_tactile_finetune is enabled without resume/pretrained_path. "
+                "Expected workflow is to start from a stage-1 checkpoint."
+            )
+        logging.info(
+            "Running stage-2 tactile finetuning: backbone frozen, LoRA + tactile adapter trainable."
+        )
+
     accelerator_kwargs = {
         "step_scheduler_with_optimizer": False,
         "split_batches": False,  # split_batches == True is not working anyways

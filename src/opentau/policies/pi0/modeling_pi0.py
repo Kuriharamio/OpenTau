@@ -175,6 +175,75 @@ def pad_vector(vector: Tensor, new_dim: int) -> Tensor:
     return new_vector
 
 
+class PluginTactileAdapter(nn.Module):
+    """Plugin tactile adapter with dual-path encoding and gated fusion."""
+
+    def __init__(self, input_dim: int, proj_dim: int, num_tokens: int, hidden_dim: int):
+        super().__init__()
+        self.input_dim = input_dim
+        self.proj_dim = proj_dim
+        self.num_tokens = num_tokens
+
+        self.pool_proj = nn.Linear(input_dim, proj_dim)
+        self.local_proj = nn.Linear(input_dim, proj_dim)
+        self.gate_proj = nn.Linear(input_dim, 1)
+        self.fusion_mlp = nn.Sequential(
+            nn.Linear(proj_dim * 2, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, proj_dim),
+        )
+        self.sinusoid_mlp = nn.Sequential(
+            nn.Linear(proj_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, proj_dim),
+        )
+
+    def _to_token_sequence(self, tactile: Tensor) -> Tensor:
+        if tactile.ndim == 2:
+            tactile = tactile[:, None, :]
+        elif tactile.ndim >= 4:
+            tactile = tactile.flatten(start_dim=2)
+        elif tactile.ndim != 3:
+            raise ValueError(f"Unsupported tactile tensor shape {tuple(tactile.shape)}")
+
+        feature_dim = tactile.shape[-1]
+        if feature_dim < self.input_dim:
+            tactile = pad_vector(tactile, self.input_dim)
+        elif feature_dim > self.input_dim:
+            tactile = tactile[..., : self.input_dim]
+
+        if tactile.shape[1] != self.num_tokens:
+            tactile = tactile.transpose(1, 2)
+            tactile = F.adaptive_avg_pool1d(tactile, self.num_tokens)
+            tactile = tactile.transpose(1, 2)
+
+        return tactile
+
+    def forward(self, tactile: Tensor) -> Tensor:
+        tactile = self._to_token_sequence(tactile)
+        bsize, num_tokens, _ = tactile.shape
+
+        pooled = tactile.mean(dim=1, keepdim=True).expand(-1, num_tokens, -1)
+        gate = torch.sigmoid(self.gate_proj(tactile))
+
+        local_emb = self.local_proj(tactile)
+        pooled_emb = self.pool_proj(pooled)
+        fused = torch.cat([gate * local_emb, (1.0 - gate) * pooled_emb], dim=-1)
+        fused = self.fusion_mlp(fused)
+
+        phase = gate.reshape(-1)
+        sinusoid = create_sinusoidal_pos_embedding(
+            phase,
+            self.proj_dim,
+            min_period=4e-3,
+            max_period=4.0,
+            device=tactile.device,
+        ).to(dtype=fused.dtype)
+        sinusoid = sinusoid.reshape(bsize, num_tokens, -1)
+
+        return self.sinusoid_mlp(sinusoid * fused)
+
+
 class PI0Policy(PreTrainedPolicy):
     """Wrapper class around PI0FlowMatching model to train and run inference within OpenTau."""
 
@@ -407,12 +476,14 @@ class PI0Policy(PreTrainedPolicy):
         lang_tokens, lang_masks = self.prepare_language(batch)
 
         state = batch["state"]
+        tactile = batch.get("tactile")
         actions = self.model.sample_actions(
             images,
             img_masks,
             lang_tokens,
             lang_masks,
             state,
+            tactile=tactile,
             noise=noise,
         )
 
@@ -445,11 +516,22 @@ class PI0Policy(PreTrainedPolicy):
 
         images, img_masks = self.prepare_images(batch)
         state = batch["state"]
+        tactile = batch.get("tactile")
         lang_tokens, lang_masks = self.prepare_language(batch)
         actions = batch["actions"]
         actions_is_pad = batch.get("action_is_pad")
 
-        losses = self.model.forward(images, img_masks, lang_tokens, lang_masks, state, actions, noise, time)
+        losses = self.model.forward(
+            images,
+            img_masks,
+            lang_tokens,
+            lang_masks,
+            state,
+            actions,
+            tactile=tactile,
+            noise=noise,
+            time=time,
+        )
 
         if actions_is_pad is not None:
             in_episode_bound = ~actions_is_pad
@@ -600,8 +682,28 @@ class PI0FlowMatching(nn.Module):
             attention_implementation=self.config.attention_implementation,
             load_pretrained_paligemma=load_pretrained_paligemma,
             dropout=self.config.dropout,
+            enable_lora=self.config.enable_lora,
+            lora_rank=self.config.lora_rank,
+            lora_alpha=self.config.lora_alpha,
+            lora_dropout=self.config.lora_dropout,
+            lora_target_modules=self.config.lora_target_modules,
+            stage2_tactile_finetune=self.config.stage2_tactile_finetune,
         )
         self.paligemma_with_expert = PaliGemmaWithExpertModel(paligemma_with_export_config)
+
+        self.tactile_adapter = PluginTactileAdapter(
+            input_dim=self.config.tactile_dim,
+            proj_dim=self.config.proj_width,
+            num_tokens=self.config.tactile_tokens,
+            hidden_dim=self.config.tactile_adapter_hidden,
+        )
+        self.tactile_cross_attn = nn.MultiheadAttention(
+            embed_dim=self.config.proj_width,
+            num_heads=self.config.tactile_cross_attention_heads,
+            dropout=self.config.dropout,
+            batch_first=True,
+        )
+        self.tactile_attn_dropout = nn.Dropout(self.config.dropout)
 
         # Projections are float32
         self.state_proj = nn.Linear(self.config.max_state_dim, self.config.proj_width)
@@ -619,6 +721,18 @@ class PI0FlowMatching(nn.Module):
         """Sets the requires_grad attribute for state projection parameters."""
         for params in self.state_proj.parameters():
             params.requires_grad = self.config.train_state_proj
+
+        if self.config.stage2_tactile_finetune:
+            for param in self.parameters():
+                param.requires_grad = False
+
+            for name, param in self.named_parameters():
+                if "tactile_adapter" in name or "tactile_cross_attn" in name or "lora_" in name:
+                    param.requires_grad = True
+
+            if self.config.train_state_proj:
+                for params in self.state_proj.parameters():
+                    params.requires_grad = True
 
     def _init_weights(self, module: nn.Module) -> None:
         """Initialize weights using He (Kaiming) initialization.
@@ -817,6 +931,19 @@ class PI0FlowMatching(nn.Module):
 
         return embs, pad_masks, att_masks
 
+    def cross_attend_tactile(self, suffix_embs: Tensor, tactile: Tensor | None) -> Tensor:
+        if not self.config.enable_tactile or tactile is None:
+            return suffix_embs
+
+        tactile_embs = self.tactile_adapter(tactile).to(dtype=suffix_embs.dtype)
+        attn_out, _ = self.tactile_cross_attn(
+            query=suffix_embs,
+            key=tactile_embs,
+            value=tactile_embs,
+            need_weights=False,
+        )
+        return suffix_embs + self.tactile_attn_dropout(attn_out)
+
     def forward(
         self,
         images: list[Tensor],
@@ -825,6 +952,7 @@ class PI0FlowMatching(nn.Module):
         lang_masks: Tensor,
         state: Tensor,
         actions: Tensor,
+        tactile: Tensor | None = None,
         noise: Tensor | None = None,
         time: Tensor | None = None,
     ) -> Tensor:
@@ -857,6 +985,7 @@ class PI0FlowMatching(nn.Module):
             images, img_masks, lang_tokens, lang_masks
         )
         suffix_embs, suffix_pad_masks, suffix_att_masks = self.embed_suffix(state, x_t, time)
+        suffix_embs = self.cross_attend_tactile(suffix_embs, tactile)
 
         pad_masks = torch.cat([prefix_pad_masks, suffix_pad_masks], dim=1)
         att_masks = torch.cat([prefix_att_masks, suffix_att_masks], dim=1)
@@ -887,6 +1016,7 @@ class PI0FlowMatching(nn.Module):
         lang_tokens: Tensor,
         lang_masks: Tensor,
         state: Tensor,
+        tactile: Tensor | None = None,
         noise: Tensor | None = None,
     ) -> Tensor:
         """Do a full inference forward and compute the action (batch_size x num_steps x num_motors).
@@ -938,6 +1068,7 @@ class PI0FlowMatching(nn.Module):
                 past_key_values,
                 x_t,
                 expanded_time,
+                tactile=tactile,
             )
 
             # Euler step
@@ -952,6 +1083,7 @@ class PI0FlowMatching(nn.Module):
         past_key_values: list[dict[str, Tensor]],
         x_t: Tensor,
         timestep: Tensor,
+        tactile: Tensor | None = None,
     ) -> Tensor:
         """Apply one denoising step of the noise `x_t` at a given timestep.
 
@@ -966,6 +1098,7 @@ class PI0FlowMatching(nn.Module):
             The predicted velocity tensor (v_t).
         """
         suffix_embs, suffix_pad_masks, suffix_att_masks = self.embed_suffix(state, x_t, timestep)
+        suffix_embs = self.cross_attend_tactile(suffix_embs, tactile)
 
         suffix_len = suffix_pad_masks.shape[1]
         batch_size = prefix_pad_masks.shape[0]

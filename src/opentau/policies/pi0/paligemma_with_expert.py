@@ -21,6 +21,8 @@ Vision-Language Model (VLM) with a Gemma-based expert model to handle
 action generation and conditioning.
 """
 
+import math
+
 import torch
 import torch.version
 from pytest import Cache
@@ -33,6 +35,39 @@ from transformers import (
     PreTrainedModel,
 )
 from transformers.models.auto import CONFIG_MAPPING
+
+
+class LoRALinear(nn.Module):
+    """Low-rank adapter wrapper for a linear layer."""
+
+    def __init__(
+        self,
+        base_layer: nn.Linear,
+        rank: int,
+        alpha: float,
+        dropout: float,
+    ):
+        super().__init__()
+        if rank <= 0:
+            raise ValueError(f"Expected positive LoRA rank, got {rank}")
+
+        self.base_layer = base_layer
+        self.rank = rank
+        self.scaling = alpha / rank
+        self.dropout = nn.Dropout(dropout)
+        self.lora_A = nn.Linear(base_layer.in_features, rank, bias=False)
+        self.lora_B = nn.Linear(rank, base_layer.out_features, bias=False)
+
+        nn.init.kaiming_uniform_(self.lora_A.weight, a=math.sqrt(5))
+        nn.init.zeros_(self.lora_B.weight)
+
+        for param in self.base_layer.parameters():
+            param.requires_grad = False
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        base_out = self.base_layer(x)
+        lora_out = self.lora_B(self.lora_A(self.dropout(x)))
+        return base_out + self.scaling * lora_out
 
 
 def apply_rope(x: torch.Tensor, positions: torch.Tensor, max_wavelength: int = 10_000) -> torch.Tensor:
@@ -83,6 +118,12 @@ class PaliGemmaWithExpertConfig(PretrainedConfig):
         attention_implementation: str = "eager",
         load_pretrained_paligemma: bool = False,
         dropout: float = 0.1,
+        enable_lora: bool = False,
+        lora_rank: int = 8,
+        lora_alpha: float = 16.0,
+        lora_dropout: float = 0.0,
+        lora_target_modules: tuple[str, ...] = ("q_proj", "k_proj", "v_proj", "o_proj"),
+        stage2_tactile_finetune: bool = False,
         **kwargs,
     ):
         """Initializes the configuration.
@@ -102,6 +143,12 @@ class PaliGemmaWithExpertConfig(PretrainedConfig):
         self.attention_implementation = attention_implementation
         self.load_pretrained_paligemma = load_pretrained_paligemma
         self.dropout = dropout
+        self.enable_lora = enable_lora
+        self.lora_rank = lora_rank
+        self.lora_alpha = lora_alpha
+        self.lora_dropout = lora_dropout
+        self.lora_target_modules = lora_target_modules
+        self.stage2_tactile_finetune = stage2_tactile_finetune
 
         if paligemma_config is None:
             # Default config from Pi0
@@ -198,6 +245,9 @@ class PaliGemmaWithExpertConfig(PretrainedConfig):
                 f"Wrong value provided for `attention_implementation` ({self.attention_implementation}). Expected 'eager' or 'fa2'."
             )
 
+        if self.enable_lora and self.lora_rank <= 0:
+            raise ValueError(f"Expected lora_rank > 0, got {self.lora_rank}")
+
 
 class PaliGemmaWithExpertModel(PreTrainedModel):
     """PaliGemma model with an additional expert module for action generation."""
@@ -223,8 +273,41 @@ class PaliGemmaWithExpertModel(PreTrainedModel):
 
         self.dropout = nn.Dropout(config.dropout)
 
+        if self.config.enable_lora:
+            self._apply_lora_to_attention_projections()
+
         self.to_bfloat16_like_physical_intelligence()
         self.set_requires_grad()
+
+    def _wrap_linear_with_lora(self, module: nn.Module, attr_name: str) -> bool:
+        layer = getattr(module, attr_name, None)
+        if layer is None or not isinstance(layer, nn.Linear):
+            return False
+        wrapped = LoRALinear(
+            base_layer=layer,
+            rank=self.config.lora_rank,
+            alpha=self.config.lora_alpha,
+            dropout=self.config.lora_dropout,
+        )
+        setattr(module, attr_name, wrapped)
+        return True
+
+    def _apply_lora_to_attention_projections(self) -> None:
+        targets = set(self.config.lora_target_modules)
+        models = [self.paligemma.language_model.model.layers, self.gemma_expert.model.layers]
+        for layers in models:
+            for layer in layers:
+                for projection_name in targets:
+                    self._wrap_linear_with_lora(layer.self_attn, projection_name)
+
+    def set_trainable_for_tactile_finetune(self) -> None:
+        """Freeze backbone and keep LoRA parameters trainable for stage-2 tactile finetuning."""
+        for param in self.parameters():
+            param.requires_grad = False
+
+        for name, param in self.named_parameters():
+            if "lora_A" in name or "lora_B" in name:
+                param.requires_grad = True
 
     def set_requires_grad(self) -> None:
         """Sets the requires_grad attribute for model parameters based on configuration."""
@@ -237,6 +320,9 @@ class PaliGemmaWithExpertModel(PreTrainedModel):
             self.paligemma.eval()
             for params in self.paligemma.parameters():
                 params.requires_grad = False
+
+        if self.config.stage2_tactile_finetune:
+            self.set_trainable_for_tactile_finetune()
 
     def train(self, mode: bool = True) -> None:
         """Sets the module in training mode.

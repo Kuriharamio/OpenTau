@@ -246,13 +246,19 @@ DATA_FEATURES_NAME_MAPPING = {
         "prompt": "task",
         "response": "response",
     },
-    "custom": {
+    "custom_absolute": {
         "camera0": "observation.front_cam",
         "camera1": "observation.wrist_cam",
         "state": "observation.state",
         "actions": "action",
         "prompt": "task",
-        "response": "response",
+    },
+    "custom_delta": {
+        "camera0": "observation.front_cam",
+        "camera1": "observation.wrist_cam",
+        "state": "observation.state",
+        "actions": "action",
+        "prompt": "task",
     },
 }
 
@@ -283,5 +289,6 @@ LOSS_TYPE_MAPPING = {
     "clevr": "CE",
     "cocoqa": "CE",
     "lerobot_dummy": "MSE",
-    "custom": "MSE",
+    "custom_absolute": "MSE",
+    "custom_delta": "MSE",
 }
