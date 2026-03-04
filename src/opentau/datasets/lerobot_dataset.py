@@ -710,6 +710,13 @@ class BaseDataset(torch.utils.data.Dataset):
                 continue
             standard_item[new_key] = item[key]
 
+        if "response" not in standard_item and "response" in item:
+            standard_item["response"] = item["response"]
+
+        tactile = self._build_tactile_tensor(item)
+        if tactile is not None:
+            standard_item["tactile"] = tactile
+
         # pad state and action vectors
         standard_item["state"] = self.pad_vector(standard_item["state"], self.max_state_dim)
         standard_item["actions"] = self.pad_vector(standard_item["actions"], self.max_action_dim)
@@ -734,6 +741,48 @@ class BaseDataset(torch.utils.data.Dataset):
             standard_item[key] = standard_item[key].replace("\n", " ") + "\n"
 
         return standard_item
+
+    @staticmethod
+    def _build_tactile_tensor(item: dict) -> torch.Tensor | None:
+        """Build tactile tensor from three-finger force/torque vectors.
+
+        Expected per-finger keys in item:
+            observation.<finger>.force_vectors: [52, 3]
+            observation.<finger>.torque_vectors: [52, 3]
+
+        Returns:
+            Tensor of shape [3, 52, 6] ordered as thumb, index, middle,
+            or None if required keys are unavailable.
+        """
+        fingers = ["thumb", "index", "middle"]
+        finger_tensors = []
+
+        for finger in fingers:
+            force_key = f"observation.{finger}.force_vectors"
+            torque_key = f"observation.{finger}.torque_vectors"
+            if force_key not in item or torque_key not in item:
+                return None
+
+            force = item[force_key]
+            torque = item[torque_key]
+
+            if not isinstance(force, torch.Tensor):
+                force = torch.as_tensor(force)
+            if not isinstance(torque, torch.Tensor):
+                torque = torch.as_tensor(torque)
+
+            if force.ndim == 3:
+                force = force[-1]
+            if torque.ndim == 3:
+                torque = torque[-1]
+
+            if force.ndim != 2 or torque.ndim != 2 or force.shape[-1] != 3 or torque.shape[-1] != 3:
+                return None
+
+            finger_tensors.append(torch.cat([force, torque], dim=-1))
+
+        tactile = torch.stack(finger_tensors, dim=0)
+        return tactile.to(dtype=torch.float32)
 
     def resize_with_pad(self, img, width, height, pad_value=0) -> torch.Tensor:
         """Resize an image to target dimensions with padding.

@@ -243,6 +243,78 @@ def pad_discrete_tokens(tokens: list[list[int]], max_length: int) -> tuple[np.nd
     return np.array(discrete_action_tokens), np.array(discrete_action_masks)
 
 
+class PluginTactileAdapter(nn.Module):
+    """Plugin tactile adapter with dual-path encoding and gated fusion."""
+
+    def __init__(self, input_dim: int, proj_dim: int, num_tokens: int, hidden_dim: int):
+        super().__init__()
+        self.input_dim = input_dim
+        self.proj_dim = proj_dim
+        self.num_tokens = num_tokens
+
+        self.num_fingers = 3
+        self.num_points = 52
+        self.per_point_dim = 6
+        self.summary_input_dim = self.num_fingers * self.per_point_dim
+        self.detail_input_dim = self.num_fingers * self.num_points * self.per_point_dim
+
+        self.finger_summary_proj = nn.Linear(self.summary_input_dim, proj_dim)
+        self.point_detail_proj = nn.Linear(self.detail_input_dim, proj_dim)
+        self.gate_proj = nn.Linear(proj_dim * 2, proj_dim * 2)
+        self.fusion_mlp = nn.Sequential(
+            nn.Linear(proj_dim * 2, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, proj_dim),
+        )
+
+        self.token_positional = nn.Parameter(torch.zeros(num_tokens, proj_dim))
+
+    def _reshape_tactile(self, tactile: Tensor) -> Tensor:
+        if tactile.ndim == 3:
+            tactile = tactile.unsqueeze(0)
+
+        if tactile.ndim == 2:
+            if tactile.shape[-1] < self.detail_input_dim:
+                tactile = pad_vector(tactile, self.detail_input_dim)
+            elif tactile.shape[-1] > self.detail_input_dim:
+                tactile = tactile[..., : self.detail_input_dim]
+            tactile = tactile.reshape(-1, self.num_fingers, self.num_points, self.per_point_dim)
+            return tactile
+
+        if tactile.ndim != 4:
+            raise ValueError(f"Unsupported tactile tensor shape {tuple(tactile.shape)}")
+
+        batch_size = tactile.shape[0]
+        flattened = tactile.reshape(batch_size, -1)
+        if flattened.shape[-1] < self.detail_input_dim:
+            flattened = pad_vector(flattened, self.detail_input_dim)
+        elif flattened.shape[-1] > self.detail_input_dim:
+            flattened = flattened[..., : self.detail_input_dim]
+
+        return flattened.reshape(batch_size, self.num_fingers, self.num_points, self.per_point_dim)
+
+    def forward(self, tactile: Tensor) -> Tensor:
+        tactile = self._reshape_tactile(tactile).to(dtype=torch.float32)
+        batch_size = tactile.shape[0]
+
+        finger_summary = tactile.mean(dim=2).reshape(batch_size, -1)
+        path_a = self.finger_summary_proj(finger_summary)
+
+        point_detail = tactile.reshape(batch_size, -1)
+        path_b = self.point_detail_proj(point_detail)
+
+        combined = torch.cat([path_a, path_b], dim=-1)
+        gate = torch.sigmoid(self.gate_proj(combined))
+        gated = gate * combined
+
+        sinusoid = torch.sin(gated) + torch.cos(gated)
+        tactile_embedding = self.fusion_mlp(sinusoid)
+
+        tactile_tokens = tactile_embedding[:, None, :].expand(-1, self.num_tokens, -1)
+        tactile_tokens = tactile_tokens + self.token_positional[None, :, :]
+        return tactile_tokens
+
+
 class PI05Policy(PreTrainedPolicy):
     """Wrapper class around PI05FlowMatching model to train and run inference within OpenTau."""
 
@@ -553,12 +625,14 @@ class PI05Policy(PreTrainedPolicy):
 
         images, img_masks = self.prepare_images(batch)
         lang_tokens, lang_masks = self.prepare_language(batch)
+        tactile = batch.get("tactile")
 
         actions = self.model.sample_actions(
             images,
             img_masks,
             lang_tokens,
             lang_masks,
+            tactile=tactile,
             noise=noise,
         )
 
@@ -599,6 +673,7 @@ class PI05Policy(PreTrainedPolicy):
         discrete_actions, discrete_action_masks = self.prepare_discrete_actions(
             batch
         )  # in discrete_action_masks we have True for real tokens and False for padded tokens
+        tactile = batch.get("tactile")
         actions = batch["actions"]
         actions_is_pad = batch.get(
             "action_is_pad"
@@ -610,10 +685,11 @@ class PI05Policy(PreTrainedPolicy):
             lang_tokens,
             lang_masks,
             actions,
-            noise,
-            time,
-            discrete_actions,
-            discrete_action_masks,
+            tactile=tactile,
+            noise=noise,
+            time=time,
+            discrete_actions=discrete_actions,
+            discrete_action_masks=discrete_action_masks,
         )
 
         mse_loss = losses["MSE"]
@@ -818,8 +894,30 @@ class PI05FlowMatching(nn.Module):
             load_pretrained_paligemma=load_pretrained_paligemma,
             discrete_action_vocab_size=discrete_action_vocab_size,
             dropout=self.config.dropout,
+            enable_lora=self.config.enable_lora,
+            lora_rank=self.config.lora_rank,
+            lora_alpha=self.config.lora_alpha,
+            lora_dropout=self.config.lora_dropout,
+            lora_target_modules=self.config.lora_target_modules,
+            stage2_tactile_finetune=self.config.stage2_tactile_finetune,
         )
         self.paligemma_with_expert = PaliGemmaWithExpertModel(paligemma_with_export_config)
+
+        self.tactile_adapter = PluginTactileAdapter(
+            input_dim=self.config.tactile_dim,
+            proj_dim=self.config.proj_width,
+            num_tokens=self.config.tactile_tokens,
+            hidden_dim=self.config.tactile_adapter_hidden,
+        )
+        self.tactile_cross_attn = nn.MultiheadAttention(
+            embed_dim=self.config.proj_width,
+            num_heads=self.config.tactile_cross_attention_heads,
+            dropout=self.config.dropout,
+            batch_first=True,
+        )
+        self.tactile_attn_dropout = nn.Dropout(self.config.dropout)
+
+        self.set_requires_grad()
 
         # Projections are float32
         self.action_in_proj = nn.Linear(self.config.max_action_dim, self.config.proj_width)
@@ -856,6 +954,15 @@ class PI05FlowMatching(nn.Module):
                 self._init_weights(m)
         else:
             raise ValueError(f"Invalid init strategy: {self.config.init_strategy}")
+
+    def set_requires_grad(self) -> None:
+        if self.config.stage2_tactile_finetune:
+            for param in self.parameters():
+                param.requires_grad = False
+
+            for name, param in self.named_parameters():
+                if "tactile_adapter" in name or "tactile_cross_attn" in name or "lora_" in name:
+                    param.requires_grad = True
 
     def sample_noise(self, shape: tuple[int, ...], device: torch.device | str) -> Tensor:
         """Samples Gaussian noise.
@@ -1026,6 +1133,19 @@ class PI05FlowMatching(nn.Module):
 
         return embs, pad_masks, att_masks, adarms_cond
 
+    def cross_attend_tactile(self, suffix_embs: Tensor, tactile: Tensor | None) -> Tensor:
+        if not self.config.enable_tactile or tactile is None:
+            return suffix_embs
+
+        tactile_embs = self.tactile_adapter(tactile).to(dtype=suffix_embs.dtype)
+        attn_out, _ = self.tactile_cross_attn(
+            query=suffix_embs,
+            key=tactile_embs,
+            value=tactile_embs,
+            need_weights=False,
+        )
+        return suffix_embs + self.tactile_attn_dropout(attn_out)
+
     def forward(
         self,
         images: list[Tensor],
@@ -1033,6 +1153,7 @@ class PI05FlowMatching(nn.Module):
         lang_tokens: Tensor,
         lang_masks: Tensor,
         actions: Tensor,
+        tactile: Tensor | None = None,
         noise: Tensor | None = None,
         time: Tensor | None = None,
         discrete_actions: Tensor | None = None,
@@ -1086,6 +1207,7 @@ class PI05FlowMatching(nn.Module):
         u_t = noise - actions
 
         suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(x_t, time)
+        suffix_embs = self.cross_attend_tactile(suffix_embs, tactile)
 
         action_expert_2d_attention_mask = make_att_2d_masks(
             suffix_pad_masks,
@@ -1149,6 +1271,7 @@ class PI05FlowMatching(nn.Module):
         img_masks: list[Tensor],
         lang_tokens: Tensor,
         lang_masks: Tensor,
+        tactile: Tensor | None = None,
         noise: Tensor | None = None,
     ) -> Tensor:
         """Do a full inference forward and compute the action.
@@ -1201,6 +1324,7 @@ class PI05FlowMatching(nn.Module):
                 past_key_values,
                 x_t,
                 expanded_time,
+                tactile=tactile,
             )
 
             # Euler step
@@ -1214,6 +1338,7 @@ class PI05FlowMatching(nn.Module):
         past_key_values: list[dict[str, Tensor]],
         x_t: Tensor,
         timestep: Tensor,
+        tactile: Tensor | None = None,
     ) -> Tensor:
         """Apply one denoising step of the noise `x_t` at a given timestep.
 
@@ -1227,6 +1352,7 @@ class PI05FlowMatching(nn.Module):
             The predicted velocity tensor (v_t).
         """
         suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(x_t, timestep)
+        suffix_embs = self.cross_attend_tactile(suffix_embs, tactile)
 
         num_cross_att_tokens = prefix_pad_masks.shape[1]
         action_expert_2d_attention_mask = make_att_2d_masks(

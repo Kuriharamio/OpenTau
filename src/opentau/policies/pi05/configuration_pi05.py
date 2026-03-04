@@ -123,6 +123,24 @@ class PI05Config(PreTrainedConfig):
     freeze_vision_encoder: bool = True
     train_expert_only: bool = False
 
+    # DECO-style tactile plugin settings
+    enable_tactile: bool = False
+    tactile_dim: int = 64
+    tactile_tokens: int = 8
+    tactile_adapter_hidden: int = 512
+    tactile_cross_attention_heads: int = 8
+
+    # LoRA settings for attention projections
+    enable_lora: bool = False
+    lora_rank: int = 8
+    lora_alpha: float = 16.0
+    lora_dropout: float = 0.0
+    lora_target_modules: tuple[str, ...] = ("q_proj", "k_proj", "v_proj", "o_proj")
+
+    # Two-stage training presets
+    stage1_pretrain: bool = False
+    stage2_tactile_finetune: bool = False
+
     # Training presets
     optimizer_lr: float = 2.5e-5
     optimizer_betas: tuple[float, float] = (0.9, 0.95)
@@ -161,6 +179,27 @@ class PI05Config(PreTrainedConfig):
         if self.pretrained_path is not None and self.pretrained_path != "lerobot/pi05":
             logging.info("Setting init_strategy to 'no_init' because we are resuming from a checkpoint.")
             self.init_strategy = "no_init"
+
+        if self.enable_lora:
+            if self.lora_rank <= 0:
+                raise ValueError(f"Expected lora_rank > 0, got {self.lora_rank}")
+            if self.lora_alpha <= 0:
+                raise ValueError(f"Expected lora_alpha > 0, got {self.lora_alpha}")
+
+        if self.enable_tactile:
+            if self.tactile_dim <= 0:
+                raise ValueError(f"Expected tactile_dim > 0, got {self.tactile_dim}")
+            if self.tactile_tokens <= 0:
+                raise ValueError(f"Expected tactile_tokens > 0, got {self.tactile_tokens}")
+
+        if self.stage1_pretrain and self.stage2_tactile_finetune:
+            raise ValueError("stage1_pretrain and stage2_tactile_finetune cannot both be true")
+
+        if self.stage2_tactile_finetune and not self.enable_tactile:
+            raise ValueError("stage2_tactile_finetune requires enable_tactile=True")
+
+        if self.stage2_tactile_finetune and not self.enable_lora:
+            raise ValueError("stage2_tactile_finetune requires enable_lora=True")
 
     def validate_features(self) -> None:
         """Validates the features and adds empty cameras if configured.

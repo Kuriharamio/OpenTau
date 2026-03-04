@@ -184,64 +184,67 @@ class PluginTactileAdapter(nn.Module):
         self.proj_dim = proj_dim
         self.num_tokens = num_tokens
 
-        self.pool_proj = nn.Linear(input_dim, proj_dim)
-        self.local_proj = nn.Linear(input_dim, proj_dim)
-        self.gate_proj = nn.Linear(input_dim, 1)
+        self.num_fingers = 3
+        self.num_points = 52
+        self.per_point_dim = 6
+        self.summary_input_dim = self.num_fingers * self.per_point_dim
+        self.detail_input_dim = self.num_fingers * self.num_points * self.per_point_dim
+
+        self.finger_summary_proj = nn.Linear(self.summary_input_dim, proj_dim)
+        self.point_detail_proj = nn.Linear(self.detail_input_dim, proj_dim)
+        self.gate_proj = nn.Linear(proj_dim * 2, proj_dim * 2)
         self.fusion_mlp = nn.Sequential(
             nn.Linear(proj_dim * 2, hidden_dim),
             nn.SiLU(),
             nn.Linear(hidden_dim, proj_dim),
         )
-        self.sinusoid_mlp = nn.Sequential(
-            nn.Linear(proj_dim, hidden_dim),
-            nn.SiLU(),
-            nn.Linear(hidden_dim, proj_dim),
-        )
 
-    def _to_token_sequence(self, tactile: Tensor) -> Tensor:
+        self.token_positional = nn.Parameter(torch.zeros(num_tokens, proj_dim))
+
+    def _reshape_tactile(self, tactile: Tensor) -> Tensor:
+        if tactile.ndim == 3:
+            tactile = tactile.unsqueeze(0)
+
         if tactile.ndim == 2:
-            tactile = tactile[:, None, :]
-        elif tactile.ndim >= 4:
-            tactile = tactile.flatten(start_dim=2)
-        elif tactile.ndim != 3:
+            if tactile.shape[-1] < self.detail_input_dim:
+                tactile = pad_vector(tactile, self.detail_input_dim)
+            elif tactile.shape[-1] > self.detail_input_dim:
+                tactile = tactile[..., : self.detail_input_dim]
+            tactile = tactile.reshape(-1, self.num_fingers, self.num_points, self.per_point_dim)
+            return tactile
+
+        if tactile.ndim != 4:
             raise ValueError(f"Unsupported tactile tensor shape {tuple(tactile.shape)}")
 
-        feature_dim = tactile.shape[-1]
-        if feature_dim < self.input_dim:
-            tactile = pad_vector(tactile, self.input_dim)
-        elif feature_dim > self.input_dim:
-            tactile = tactile[..., : self.input_dim]
+        batch_size = tactile.shape[0]
+        flattened = tactile.reshape(batch_size, -1)
+        if flattened.shape[-1] < self.detail_input_dim:
+            flattened = pad_vector(flattened, self.detail_input_dim)
+        elif flattened.shape[-1] > self.detail_input_dim:
+            flattened = flattened[..., : self.detail_input_dim]
 
-        if tactile.shape[1] != self.num_tokens:
-            tactile = tactile.transpose(1, 2)
-            tactile = F.adaptive_avg_pool1d(tactile, self.num_tokens)
-            tactile = tactile.transpose(1, 2)
-
-        return tactile
+        return flattened.reshape(batch_size, self.num_fingers, self.num_points, self.per_point_dim)
 
     def forward(self, tactile: Tensor) -> Tensor:
-        tactile = self._to_token_sequence(tactile)
-        bsize, num_tokens, _ = tactile.shape
+        tactile = self._reshape_tactile(tactile).to(dtype=torch.float32)
+        batch_size = tactile.shape[0]
 
-        pooled = tactile.mean(dim=1, keepdim=True).expand(-1, num_tokens, -1)
-        gate = torch.sigmoid(self.gate_proj(tactile))
+        finger_summary = tactile.mean(dim=2).reshape(batch_size, -1)
+        path_a = self.finger_summary_proj(finger_summary)
 
-        local_emb = self.local_proj(tactile)
-        pooled_emb = self.pool_proj(pooled)
-        fused = torch.cat([gate * local_emb, (1.0 - gate) * pooled_emb], dim=-1)
-        fused = self.fusion_mlp(fused)
+        point_detail = tactile.reshape(batch_size, -1)
+        path_b = self.point_detail_proj(point_detail)
 
-        phase = gate.reshape(-1)
-        sinusoid = create_sinusoidal_pos_embedding(
-            phase,
-            self.proj_dim,
-            min_period=4e-3,
-            max_period=4.0,
-            device=tactile.device,
-        ).to(dtype=fused.dtype)
-        sinusoid = sinusoid.reshape(bsize, num_tokens, -1)
+        combined = torch.cat([path_a, path_b], dim=-1)
+        gate = torch.sigmoid(self.gate_proj(combined))
+        gated = gate * combined
 
-        return self.sinusoid_mlp(sinusoid * fused)
+        sinusoid = torch.sin(gated) + torch.cos(gated)
+        tactile_embedding = self.fusion_mlp(sinusoid)
+
+        tactile_tokens = tactile_embedding[:, None, :].expand(-1, self.num_tokens, -1)
+        tactile_tokens = tactile_tokens + self.token_positional[None, :, :]
+        return tactile_tokens
 
 
 class PI0Policy(PreTrainedPolicy):
