@@ -199,6 +199,18 @@ def resize_with_pad(img: Tensor, width: int, height: int, pad_value: int = -1) -
     return padded_img
 
 
+def pad_vector(vector: Tensor, new_dim: int) -> Tensor:
+    """Pads the last dimension of a vector to a new size with zeros."""
+    if vector.shape[-1] == new_dim:
+        return vector
+    shape = list(vector.shape)
+    current_dim = shape[-1]
+    shape[-1] = new_dim
+    new_vector = torch.zeros(*shape, dtype=vector.dtype, device=vector.device)
+    new_vector[..., :current_dim] = vector
+    return new_vector
+
+
 def pad_discrete_tokens(tokens: list[list[int]], max_length: int) -> tuple[np.ndarray, np.ndarray]:
     """Pads or truncates a list of discrete action token sequences to a fixed length.
 
@@ -694,9 +706,9 @@ class PI05Policy(PreTrainedPolicy):
             img_masks,
             lang_tokens,
             lang_masks,
+            action_prefix=action_prefix,
+            delay=delay,
             tactile=tactile,
-            action_prefix,
-            delay,
             noise=noise,
         )
 
@@ -1477,9 +1489,9 @@ class PI05FlowMatching(nn.Module):
         img_masks: list[Tensor],
         lang_tokens: Tensor,
         lang_masks: Tensor,
-        tactile: Tensor | None = None,
         action_prefix: Tensor,
         delay: Tensor,
+        tactile: Tensor | None = None,
         noise: Tensor | None = None,
     ) -> Tensor:
         """Do a full inference forward and compute the action.
