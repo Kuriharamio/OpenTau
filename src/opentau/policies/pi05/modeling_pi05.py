@@ -758,15 +758,15 @@ class PI05Policy(PreTrainedPolicy):
         )  # in actions_is_pad we have False for real actions and True for padded actions
 
         losses = self.model.forward(
-            images,
-            img_masks,
-            lang_tokens,
-            lang_masks,
-            actions,
-            actions_is_pad,
-            response_tokens,
-            response_masks,
+            images=images,
+            img_masks=img_masks,
+            lang_tokens=lang_tokens,
+            lang_masks=lang_masks,
+            actions=actions,
             tactile=tactile,
+            actions_is_pad=actions_is_pad,
+            response_tokens=response_tokens,
+            response_masks=response_masks,
             noise=noise,
             time=time,
             discrete_actions=discrete_actions,
