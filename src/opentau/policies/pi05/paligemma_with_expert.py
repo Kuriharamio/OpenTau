@@ -22,9 +22,8 @@ Vision-Language Model (VLM) with a Gemma-based expert model to handle
 action generation and conditioning.
 """
 
-import math
-
 import torch
+from peft import LoraConfig, TaskType, get_peft_model
 from torch import nn
 from transformers import (
     AutoConfig,
@@ -36,47 +35,6 @@ from transformers import (
 )
 from transformers.models.auto import CONFIG_MAPPING
 from transformers.models.gemma import modeling_gemma
-
-
-class LoRALinear(nn.Module):
-    """Low-rank adapter wrapper for a linear layer."""
-
-    def __init__(
-        self,
-        base_layer: nn.Linear,
-        rank: int,
-        alpha: float,
-        dropout: float,
-    ):
-        super().__init__()
-        if rank <= 0:
-            raise ValueError(f"Expected positive LoRA rank, got {rank}")
-
-        self.base_layer = base_layer
-        self.rank = rank
-        self.scaling = alpha / rank
-        self.dropout = nn.Dropout(dropout)
-        self.lora_A = nn.Linear(base_layer.in_features, rank, bias=False)
-        self.lora_B = nn.Linear(rank, base_layer.out_features, bias=False)
-
-        nn.init.kaiming_uniform_(self.lora_A.weight, a=math.sqrt(5))
-        nn.init.zeros_(self.lora_B.weight)
-
-        for param in self.base_layer.parameters():
-            param.requires_grad = False
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        base_out = self.base_layer(x)
-        lora_out = self.lora_B(self.lora_A(self.dropout(x)))
-        return base_out + self.scaling * lora_out
-
-    @property
-    def weight(self) -> torch.nn.Parameter:
-        return self.base_layer.weight
-
-    @property
-    def bias(self) -> torch.nn.Parameter | None:
-        return self.base_layer.bias
 
 
 def _preferred_dtype():
@@ -314,39 +272,19 @@ class PaliGemmaWithExpertModel(PreTrainedModel):
             self.to_bfloat16_like_physical_intelligence()
         self.set_requires_grad()
 
-    def _wrap_linear_with_lora(self, module: nn.Module, attr_name: str) -> bool:
-        layer = getattr(module, attr_name, None)
-        if layer is None or not isinstance(layer, nn.Linear):
-            return False
-        wrapped = LoRALinear(
-            base_layer=layer,
-            rank=self.config.lora_rank,
-            alpha=self.config.lora_alpha,
-            dropout=self.config.lora_dropout,
-        )
-        setattr(module, attr_name, wrapped)
-        return True
-
     def _apply_lora_to_attention_projections(self) -> None:
-        targets = set(self.config.lora_target_modules)
-        paligemma_layers = getattr(self.paligemma.language_model, "layers", None)
-        if paligemma_layers is None and hasattr(self.paligemma.language_model, "model"):
-            paligemma_layers = getattr(self.paligemma.language_model.model, "layers", None)
-
-        gemma_layers = getattr(self.gemma_expert.model, "layers", None)
-        if gemma_layers is None and hasattr(self.gemma_expert.model, "model"):
-            gemma_layers = getattr(self.gemma_expert.model.model, "layers", None)
-
-        if paligemma_layers is None or gemma_layers is None:
-            raise AttributeError(
-                "Unable to locate transformer layers for LoRA injection. "
-                "Expected `.layers` or `.model.layers` in language/expert modules."
-            )
-
-        for layers in (paligemma_layers, gemma_layers):
-            for layer in layers:
-                for projection_name in targets:
-                    self._wrap_linear_with_lora(layer.self_attn, projection_name)
+        lora_config = LoraConfig(
+            task_type=TaskType.FEATURE_EXTRACTION,
+            r=self.config.lora_rank,
+            lora_alpha=self.config.lora_alpha,
+            lora_dropout=self.config.lora_dropout,
+            target_modules=list(self.config.lora_target_modules),
+            bias="none",
+        )
+        paligemma_lora_model = get_peft_model(self.paligemma.language_model, lora_config)
+        gemma_lora_model = get_peft_model(self.gemma_expert.model, lora_config)
+        self.paligemma.language_model = paligemma_lora_model.base_model.model
+        self.gemma_expert.model = gemma_lora_model.base_model.model
 
     def set_trainable_for_tactile_finetune(self) -> None:
         """Freeze backbone and keep LoRA parameters trainable for stage-2 tactile finetuning."""
@@ -354,7 +292,7 @@ class PaliGemmaWithExpertModel(PreTrainedModel):
             param.requires_grad = False
 
         for name, param in self.named_parameters():
-            if "lora_A" in name or "lora_B" in name:
+            if "lora_" in name:
                 param.requires_grad = True
 
     def set_requires_grad(self) -> None:

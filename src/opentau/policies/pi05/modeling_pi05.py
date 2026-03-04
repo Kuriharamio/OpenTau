@@ -42,6 +42,7 @@ from opentau.policies.pi05.paligemma_with_expert import (
     PaliGemmaWithExpertModel,
 )
 from opentau.policies.pretrained import PreTrainedPolicy, T
+from opentau.policies.tactile_adapter import PluginTactileAdapter
 from opentau.utils.accelerate_utils import get_proc_accelerator
 from opentau.utils.utils import get_safe_dtype
 
@@ -240,79 +241,6 @@ def pad_discrete_tokens(tokens: list[list[int]], max_length: int) -> tuple[np.nd
             )
             discrete_action_tokens.append(np.pad(token, (0, max_length - len(token)), constant_values=0))
     return np.array(discrete_action_tokens), np.array(discrete_action_masks)
-
-
-class PluginTactileAdapter(nn.Module):
-    """Plugin tactile adapter with dual-path encoding and gated fusion."""
-
-    def __init__(self, input_dim: int, proj_dim: int, num_tokens: int, hidden_dim: int):
-        super().__init__()
-        self.input_dim = input_dim
-        self.proj_dim = proj_dim
-        self.num_tokens = num_tokens
-
-        self.num_fingers = 3
-        self.num_points = 52
-        self.per_point_dim = 6
-        self.summary_input_dim = self.num_fingers * self.per_point_dim
-        self.detail_input_dim = self.num_fingers * self.num_points * self.per_point_dim
-
-        self.finger_summary_proj = nn.Linear(self.summary_input_dim, proj_dim)
-        self.point_detail_proj = nn.Linear(self.detail_input_dim, proj_dim)
-        self.gate_proj = nn.Linear(proj_dim * 2, proj_dim * 2)
-        self.fusion_mlp = nn.Sequential(
-            nn.Linear(proj_dim * 2, hidden_dim),
-            nn.SiLU(),
-            nn.Linear(hidden_dim, proj_dim),
-        )
-
-        self.token_positional = nn.Parameter(torch.zeros(num_tokens, proj_dim))
-
-    def _reshape_tactile(self, tactile: Tensor) -> Tensor:
-        if tactile.ndim == 3:
-            tactile = tactile.unsqueeze(0)
-
-        if tactile.ndim == 2:
-            if tactile.shape[-1] < self.detail_input_dim:
-                tactile = pad_vector(tactile, self.detail_input_dim)
-            elif tactile.shape[-1] > self.detail_input_dim:
-                tactile = tactile[..., : self.detail_input_dim]
-            tactile = tactile.reshape(-1, self.num_fingers, self.num_points, self.per_point_dim)
-            return tactile
-
-        if tactile.ndim != 4:
-            raise ValueError(f"Unsupported tactile tensor shape {tuple(tactile.shape)}")
-
-        batch_size = tactile.shape[0]
-        flattened = tactile.reshape(batch_size, -1)
-        if flattened.shape[-1] < self.detail_input_dim:
-            flattened = pad_vector(flattened, self.detail_input_dim)
-        elif flattened.shape[-1] > self.detail_input_dim:
-            flattened = flattened[..., : self.detail_input_dim]
-
-        return flattened.reshape(batch_size, self.num_fingers, self.num_points, self.per_point_dim)
-
-    def forward(self, tactile: Tensor) -> Tensor:
-        proj_dtype = self.finger_summary_proj.weight.dtype
-        tactile = self._reshape_tactile(tactile).to(dtype=proj_dtype)
-        batch_size = tactile.shape[0]
-
-        finger_summary = tactile.mean(dim=2).reshape(batch_size, -1)
-        path_a = self.finger_summary_proj(finger_summary)
-
-        point_detail = tactile.reshape(batch_size, -1)
-        path_b = self.point_detail_proj(point_detail)
-
-        combined = torch.cat([path_a, path_b], dim=-1)
-        gate = torch.sigmoid(self.gate_proj(combined))
-        gated = gate * combined
-
-        sinusoid = torch.sin(gated) + torch.cos(gated)
-        tactile_embedding = self.fusion_mlp(sinusoid)
-
-        tactile_tokens = tactile_embedding[:, None, :].expand(-1, self.num_tokens, -1)
-        tactile_tokens = tactile_tokens + self.token_positional[None, :, :].to(dtype=tactile_tokens.dtype)
-        return tactile_tokens
 
 
 class PI05Policy(PreTrainedPolicy):
@@ -522,6 +450,10 @@ class PI05Policy(PreTrainedPolicy):
         import re
 
         fixed_state_dict = {}
+        model_state_keys = set(self.state_dict().keys())
+        model_state_keys_no_prefix = {
+            k[len("model.") :] for k in model_state_keys if k.startswith("model.")
+        }
 
         for key, value in state_dict.items():
             new_key = key
@@ -564,6 +496,24 @@ class PI05Policy(PreTrainedPolicy):
             if "patch_embedding" in key:
                 # Some checkpoints might have this, but current model expects different structure
                 logging.warning(f"Vision embedding key might need handling: {key}")
+
+            if "normalize" not in key:
+                candidate = new_key
+                has_model_prefix = candidate.startswith("model.")
+                candidate_lookup = candidate[len("model.") :] if has_model_prefix else candidate
+
+                if candidate_lookup not in model_state_keys_no_prefix:
+                    with_base = re.sub(
+                        r"(\.self_attn\.(q_proj|k_proj|v_proj|o_proj))\.(weight|bias)$",
+                        r"\1.base_layer.\3",
+                        candidate_lookup,
+                    )
+                    without_base = candidate_lookup.replace(".base_layer.", ".")
+
+                    if with_base in model_state_keys_no_prefix:
+                        new_key = f"model.{with_base}" if has_model_prefix else with_base
+                    elif without_base in model_state_keys_no_prefix:
+                        new_key = f"model.{without_base}" if has_model_prefix else without_base
 
             fixed_state_dict[new_key] = value
 
@@ -1018,19 +968,24 @@ class PI05FlowMatching(nn.Module):
         )
         self.paligemma_with_expert = PaliGemmaWithExpertModel(paligemma_with_export_config)
 
-        self.tactile_adapter = PluginTactileAdapter(
-            input_dim=self.config.tactile_dim,
-            proj_dim=self.config.proj_width,
-            num_tokens=self.config.tactile_tokens,
-            hidden_dim=self.config.tactile_adapter_hidden,
-        )
-        self.tactile_cross_attn = nn.MultiheadAttention(
-            embed_dim=self.config.proj_width,
-            num_heads=self.config.tactile_cross_attention_heads,
-            dropout=self.config.dropout,
-            batch_first=True,
-        )
-        self.tactile_attn_dropout = nn.Dropout(self.config.dropout)
+        if self.config.enable_tactile:
+            self.tactile_adapter = PluginTactileAdapter(
+                input_dim=self.config.tactile_dim,
+                proj_dim=self.config.proj_width,
+                num_tokens=self.config.tactile_tokens,
+                hidden_dim=self.config.tactile_adapter_hidden,
+            )
+            self.tactile_cross_attn = nn.MultiheadAttention(
+                embed_dim=self.config.proj_width,
+                num_heads=self.config.tactile_cross_attention_heads,
+                dropout=self.config.dropout,
+                batch_first=True,
+            )
+            self.tactile_attn_dropout = nn.Dropout(self.config.dropout)
+        else:
+            self.tactile_adapter = None
+            self.tactile_cross_attn = None
+            self.tactile_attn_dropout = None
 
         self.set_requires_grad()
 
