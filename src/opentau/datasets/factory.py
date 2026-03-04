@@ -25,7 +25,7 @@ instantiating datasets.
 The factory supports two types of datasets:
     1. LeRobot datasets: Standard robot learning datasets loaded from HuggingFace
        repositories with configurable delta timestamps for temporal alignment.
-    2. Grounding datasets: Vision-language grounding datasets (CLEVR, COCO-QA,
+    2. VQA datasets: Vision-language vqa datasets (CLEVR, COCO-QA,
        PIXMO, VSR, etc.) for multimodal learning tasks.
 
 Key Features:
@@ -36,7 +36,7 @@ Key Features:
       during dataset creation.
     - Imagenet stats override: Optionally replaces dataset statistics with
       ImageNet normalization statistics for camera features.
-    - Grounding dataset registration: Supports extensible grounding dataset
+    - VQA dataset registration: Supports extensible vqa dataset
       registration through side-effect imports.
 
 Functions:
@@ -61,15 +61,19 @@ Example:
         >>> dataloader = mixture.get_dataloader()
 """
 
+import copy
+from typing import Tuple, Union
+
 import numpy as np
+import torch
 
 # NOTE: Don't delete; imported for side effects.
-import opentau.datasets.grounding.clevr  # noqa: F401
-import opentau.datasets.grounding.cocoqa  # noqa: F401
-import opentau.datasets.grounding.dummy  # noqa: F401
-import opentau.datasets.grounding.pixmo  # noqa: F401
-import opentau.datasets.grounding.vsr  # noqa: F401
-from opentau import available_grounding_datasets
+import opentau.datasets.vqa.clevr  # noqa: F401
+import opentau.datasets.vqa.cocoqa  # noqa: F401
+import opentau.datasets.vqa.dummy  # noqa: F401
+import opentau.datasets.vqa.pixmo  # noqa: F401
+import opentau.datasets.vqa.vsr  # noqa: F401
+from opentau import available_vqa_datasets
 from opentau.configs.default import DatasetConfig
 from opentau.configs.train import TrainPipelineConfig
 from opentau.datasets.dataset_mixture import WeightedDatasetMixture
@@ -151,8 +155,12 @@ def make_dataset(
     cfg: DatasetConfig,
     train_cfg: TrainPipelineConfig,
     return_advantage_input: bool = False,
-) -> BaseDataset:
+) -> Union[BaseDataset, Tuple[BaseDataset, BaseDataset]]:
     """Handles the logic of setting up delta timestamps and image transforms before creating a dataset.
+
+    A train and validation dataset are returned if `train_cfg.val_freq` is greater than 0.
+    The validation dataset is a subset of the train dataset, and is used for evaluation during training.
+    The validation dataset is created by splitting the train dataset into train and validation sets based on `cfg.val_split_ratio`.
 
     Args:
         cfg (DatasetConfig): A DatasetConfig used to create a LeRobotDataset.
@@ -161,22 +169,22 @@ def make_dataset(
             "episode_end_idx", "current_idx", "last_step", "episode_index", and "timestamp". Defaults to False.
 
     Raises:
-        NotImplementedError: The MultiLeRobotDataset is currently deactivated.
+        ValueError: If exactly one of `cfg.vqa` and `cfg.repo_id` is not provided.
+        ValueError: If `cfg.vqa` is not a supported vqa dataset.
 
     Returns:
-        BaseDataset
+        BaseDataset or Tuple[BaseDataset, BaseDataset]: A single dataset or a tuple of (train_dataset, val_dataset) if val_freq > 0.
     """
     image_transforms = ImageTransforms(cfg.image_transforms) if cfg.image_transforms.enable else None
 
-    if isinstance(cfg.grounding, str) + isinstance(cfg.repo_id, str) != 1:
-        raise ValueError("Exactly one of `cfg.grounding` and `cfg.repo_id` should be provided.")
+    if isinstance(cfg.vqa, str) + isinstance(cfg.repo_id, str) != 1:
+        raise ValueError("Exactly one of `cfg.vqa` and `cfg.repo_id` should be provided.")
 
-    if isinstance(cfg.grounding, str):
-        ds_cls = available_grounding_datasets.get(cfg.grounding)
+    if isinstance(cfg.vqa, str):
+        ds_cls = available_vqa_datasets.get(cfg.vqa)
         if ds_cls is None:
             raise ValueError(
-                f"Unknown grounding dataset '{cfg.grounding}'. "
-                f"Supported datasets are: {available_grounding_datasets.keys()}"
+                f"Unknown vqa dataset '{cfg.vqa}'. Supported datasets are: {available_vqa_datasets.keys()}"
             )
         # TODO support dataset-specific arg / kwargs
         dataset = ds_cls(train_cfg)
@@ -201,20 +209,28 @@ def make_dataset(
             return_advantage_input=return_advantage_input,
         )
 
-    # TODO grounding datasets implement stats in original feature names, but camera_keys are standardized names
-    if not isinstance(cfg.grounding, str) and "dummy" not in cfg.repo_id and cfg.use_imagenet_stats:
+    # TODO vqa datasets implement stats in original feature names, but camera_keys are standardized names
+    if not isinstance(cfg.vqa, str) and "dummy" not in cfg.repo_id and cfg.use_imagenet_stats:
         for key in dataset.meta.camera_keys:
             for stats_type, stats in IMAGENET_STATS.items():
                 if key not in dataset.meta.stats:
                     dataset.meta.stats[key] = {}
                 dataset.meta.stats[key][stats_type] = np.array(stats, dtype=np.float32)
 
+    if train_cfg.val_freq > 0:
+        val_size = int(len(dataset) * cfg.val_split_ratio)
+        train_size = len(dataset) - val_size
+        train_dataset, val_dataset = torch.utils.data.random_split(dataset, [train_size, val_size])
+        train_dataset.meta = copy.deepcopy(dataset.meta)
+        val_dataset.meta = copy.deepcopy(dataset.meta)
+        return train_dataset, val_dataset
+
     return dataset
 
 
 def make_dataset_mixture(
     cfg: TrainPipelineConfig, return_advantage_input: bool = False
-) -> WeightedDatasetMixture:
+) -> Union[WeightedDatasetMixture, Tuple[WeightedDatasetMixture, WeightedDatasetMixture]]:
     """Creates a dataset mixture from the provided TrainPipelineConfig.
 
     Args:
@@ -223,10 +239,26 @@ def make_dataset_mixture(
             "episode_end_idx", "current_idx", "last_step", "episode_index", and "timestamp". Defaults to False.
 
     Returns:
-        WeightedDatasetMixture: An instance of WeightedDatasetMixture containing the datasets.
+        WeightedDatasetMixture or Tuple[WeightedDatasetMixture, WeightedDatasetMixture]: An instance of WeightedDatasetMixture containing the datasets, or a tuple of (train_mixture, val_mixture) if val_freq > 0.
     """
-    datasets = [
-        make_dataset(dataset_cfg, cfg, return_advantage_input=return_advantage_input)
-        for dataset_cfg in cfg.dataset_mixture.datasets
-    ]
-    return WeightedDatasetMixture(cfg, datasets, cfg.dataset_mixture.weights, cfg.dataset_mixture.action_freq)
+    datasets = []
+    val_datasets = []
+    for dataset_cfg in cfg.dataset_mixture.datasets:
+        res = make_dataset(dataset_cfg, cfg, return_advantage_input=return_advantage_input)
+        if isinstance(res, tuple):
+            datasets.append(res[0])
+            val_datasets.append(res[1])
+        else:
+            datasets.append(res)
+
+    train_mixture = WeightedDatasetMixture(
+        cfg, datasets, cfg.dataset_mixture.weights, cfg.dataset_mixture.action_freq
+    )
+
+    if val_datasets:
+        val_mixture = WeightedDatasetMixture(
+            cfg, val_datasets, cfg.dataset_mixture.weights, cfg.dataset_mixture.action_freq
+        )
+        return train_mixture, val_mixture
+
+    return train_mixture

@@ -29,7 +29,7 @@ from pathlib import Path
 import numpy as np
 import torch
 import torch.nn.functional as F  # noqa: N812
-from einops import rearrange
+from einops import rearrange, repeat
 from torch import Tensor, nn
 from transformers import AutoProcessor, AutoTokenizer
 
@@ -42,7 +42,12 @@ from opentau.policies.pi05.paligemma_with_expert import (
     PaliGemmaWithExpertModel,
 )
 from opentau.policies.pretrained import PreTrainedPolicy, T
+from opentau.utils.accelerate_utils import get_proc_accelerator
 from opentau.utils.utils import get_safe_dtype
+
+
+def _preferred_dtype():
+    return torch.float32 if torch.onnx.is_in_onnx_export() else torch.bfloat16
 
 
 def create_sinusoidal_pos_embedding(
@@ -51,23 +56,23 @@ def create_sinusoidal_pos_embedding(
     """Computes sine-cosine positional embedding vectors for scalar positions.
 
     Args:
-        time: A 1-D tensor of shape (batch_size,).
+        time: A 2-D tensor of shape (batch_size, action_chunk_length).
         dimension: The dimension of the embedding vectors. Must be divisible by 2.
         min_period: The minimum period of the sinusoidal functions.
         max_period: The maximum period of the sinusoidal functions.
         device: The device to create the tensors on. Defaults to "cpu".
 
     Returns:
-        A tensor of shape (batch_size, dimension) containing the positional embeddings.
+        A tensor of shape (batch_size, action_chunk_length, dimension) containing the positional embeddings.
 
     Raises:
-        ValueError: If dimension is not divisible by 2 or if time tensor is not 1-D.
+        ValueError: If dimension is not divisible by 2 or if time tensor is not 2-D with shape (batch_size, action_chunk_length).
     """
     if dimension % 2 != 0:
         raise ValueError(f"dimension ({dimension}) must be divisible by 2")
 
-    if time.ndim != 1:
-        raise ValueError("The time tensor is expected to be of shape `(batch_size, )`.")
+    if time.ndim != 2:
+        raise ValueError("The time tensor is expected to be of shape `(batch_size, action_chunk_length)`.")
 
     dtype = (
         get_safe_dtype(torch.float64, device.type)
@@ -79,8 +84,8 @@ def create_sinusoidal_pos_embedding(
 
     # Compute the outer product
     scaling_factor = 1.0 / period * 2 * math.pi
-    sin_input = scaling_factor[None, :] * time[:, None]
-    pos_emb = torch.cat([torch.sin(sin_input), torch.cos(sin_input)], dim=1)
+    sin_input = rearrange(scaling_factor, "d -> 1 1 d") * rearrange(time, "b c -> b c 1")
+    pos_emb = torch.cat([torch.sin(sin_input), torch.cos(sin_input)], dim=2)
     return pos_emb
 
 
@@ -151,8 +156,8 @@ def make_att_2d_masks(
 
         # Apply padding masks: pad_masks for rows, cross_att_pad_masks for columns
         cross_att_mask = cross_att_mask & pad_masks[:, :, None] & cross_att_pad_masks[:, None, :]
-
-        att_2d_masks = torch.cat((att_2d_masks, cross_att_mask), dim=2)
+        # The cross_att_masks are concatenated before the att_2d_masks
+        att_2d_masks = torch.cat((cross_att_mask, att_2d_masks), dim=2)
 
     return att_2d_masks
 
@@ -194,27 +199,6 @@ def resize_with_pad(img: Tensor, width: int, height: int, pad_value: int = -1) -
     return padded_img
 
 
-def pad_vector(vector: Tensor, new_dim: int) -> Tensor:
-    """Pads the last dimension of a vector to a new size with zeros.
-
-    Args:
-        vector: Input tensor. Can be (batch_size x sequence_length x features_dimension)
-            or (batch_size x features_dimension).
-        new_dim: The new size for the last dimension.
-
-    Returns:
-        The padded tensor.
-    """
-    if vector.shape[-1] == new_dim:
-        return vector
-    shape = list(vector.shape)
-    current_dim = shape[-1]
-    shape[-1] = new_dim
-    new_vector = torch.zeros(*shape, dtype=vector.dtype, device=vector.device)
-    new_vector[..., :current_dim] = vector
-    return new_vector
-
-
 def pad_discrete_tokens(tokens: list[list[int]], max_length: int) -> tuple[np.ndarray, np.ndarray]:
     """Pads or truncates a list of discrete action token sequences to a fixed length.
 
@@ -231,6 +215,9 @@ def pad_discrete_tokens(tokens: list[list[int]], max_length: int) -> tuple[np.nd
     discrete_action_masks = []
     for token in tokens:
         if len(token) > max_length:
+            logging.warning(
+                f"Discrete action token length {len(token)} is greater than max_length {max_length}, truncating"
+            )
             discrete_action_tokens.append(np.array(token[:max_length]))
             discrete_action_masks.append(np.ones(max_length, dtype=bool))
         else:
@@ -342,7 +329,7 @@ class PI05Policy(PreTrainedPolicy):
         self.normalize_targets = Normalize(
             config.output_features, config.normalization_mapping, dataset_stats
         )
-        self.normalize_actions = Normalize(
+        self.normalize_discrete_actions = Normalize(
             config.output_features, {"ACTION": NormalizationMode.MIN_MAX}, dataset_stats
         )
         self.unnormalize_outputs = Unnormalize(
@@ -423,9 +410,12 @@ class PI05Policy(PreTrainedPolicy):
         model = cls(config, **kwargs)
 
         # Now manually load and remap the state dict
+        acc = get_proc_accelerator()
+        is_main_process = acc.is_main_process if acc else True
         try:
             # Try to load the pytorch_model.bin or model.safetensors file
-            print(f"Loading model from: {pretrained_name_or_path}")
+            if is_main_process:
+                print(f"Loading model from: {pretrained_name_or_path}")
             try:
                 from transformers.utils import cached_file
 
@@ -444,10 +434,12 @@ class PI05Policy(PreTrainedPolicy):
                 from safetensors.torch import load_file
 
                 original_state_dict = load_file(resolved_file)
-                print("✓ Loaded state dict from model.safetensors")
+                if is_main_process:
+                    print("✓ Loaded state dict from model.safetensors")
             except Exception as e:
-                print(f"Could not load state dict from remote files: {e}")
-                print("Returning model without loading pretrained weights")
+                if is_main_process:
+                    print(f"Could not load state dict from remote files: {e}")
+                    print("Returning model without loading pretrained weights")
                 return model
 
             # First, fix any key differences # see openpi `model.py, _fix_pytorch_state_dict_keys`
@@ -462,18 +454,18 @@ class PI05Policy(PreTrainedPolicy):
                     new_key = f"model.{key}"
                     remapped_state_dict[new_key] = value
                     remap_count += 1
-                    if remap_count <= 10:  # Only print first 10 to avoid spam
+                    if remap_count <= 10 and is_main_process:  # Only print first 10 to avoid spam
                         print(f"Remapped: {key} -> {new_key}")
                 else:
                     remapped_state_dict[key] = value
 
-            if remap_count > 0:
+            if remap_count > 0 and is_main_process:
                 print(f"Remapped {remap_count} state dict keys")
 
             # Load the remapped state dict into the model
             missing_keys, unexpected_keys = model.load_state_dict(remapped_state_dict, strict=False)
 
-            if missing_keys:
+            if missing_keys and is_main_process:
                 print(f"Missing keys when loading state dict: {len(missing_keys)} keys")
                 if len(missing_keys) <= 20:
                     for key in missing_keys:
@@ -483,7 +475,7 @@ class PI05Policy(PreTrainedPolicy):
                         print(f"  - {key}")
                     print(f"  ... and {len(missing_keys) - 20} more")
 
-            if unexpected_keys:
+            if unexpected_keys and is_main_process:
                 print(f"Unexpected keys when loading state dict: {len(unexpected_keys)} keys")
                 if len(unexpected_keys) <= 20:
                     for key in unexpected_keys:
@@ -493,11 +485,12 @@ class PI05Policy(PreTrainedPolicy):
                         print(f"  - {key}")
                     print(f"  ... and {len(unexpected_keys) - 20} more")
 
-            if not missing_keys and not unexpected_keys:
+            if not missing_keys and not unexpected_keys and is_main_process:
                 print("All keys loaded successfully!")
 
         except Exception as e:
-            print(f"Warning: Could not remap state dict keys: {e}")
+            if is_main_process:
+                print(f"Warning: Could not remap state dict keys: {e}")
 
         return model
 
@@ -590,9 +583,12 @@ class PI05Policy(PreTrainedPolicy):
     def select_action(self, batch: dict[str, Tensor], noise: Tensor | None = None) -> Tensor:
         """Select a single action given environment observations.
 
-        This method wraps `select_actions` in order to return one action at a time for execution in the
-        environment. It works by managing the actions in a queue and only calling `select_actions` when the
-        queue is empty.
+        This method uses an action queue that is replenished when it has config.max_delay or fewer actions (or is empty).
+        When replenishing, the current queue contents are used as action_prefix for sample_actions,
+        then the queue is refilled with the new chunk.
+
+        Note: This method should only be called when running a policy in simulation. For real world inference,
+        this method should be written in the ROS client node.
 
         Args:
             batch: Batch of data containing environment observations.
@@ -603,29 +599,95 @@ class PI05Policy(PreTrainedPolicy):
         """
         self.eval()
 
-        # Action queue logic for n_action_steps > 1. When the action_queue is depleted, populate it by
-        # querying the policy.
-        if len(self._action_queue) == 0:
-            actions = self.sample_actions(batch, noise=noise)
-            self._action_queue.extend(actions)
-        return self._action_queue.popleft()
+        if len(self._action_queue) == 0 or len(self._action_queue) <= self.config.max_delay:
+            # Use current queue as action prefix to replenish
+            action_prefix = None
+            delay = 0
+            if len(self._action_queue) > 0:
+                prefix_actions = list(self._action_queue)
+                delay = min(len(prefix_actions), self.config.max_delay)
+                assert delay == self.config.max_delay, f"Delay must be equal to {self.config.max_delay}"
+                prefix_actions = prefix_actions[-delay:]
+                action_prefix = torch.stack(prefix_actions, dim=1)
+            delay = torch.tensor(delay, dtype=torch.long, device=batch["state"].device)
+            actions = self.sample_actions(batch, noise=noise, action_prefix=action_prefix, delay=delay)
+            actions = rearrange(actions, "b c d -> c b d")
+            self._action_queue.extend(actions[delay:])
+            assert len(self._action_queue) == self.config.n_action_steps, (
+                f"Action queue must have {self.config.n_action_steps} actions"
+            )
+
+        action = self._action_queue.popleft()
+        return action
 
     @torch.no_grad()
-    def sample_actions(self, batch: dict[str, Tensor], noise: Tensor | None = None) -> Tensor:
+    def sample_actions(
+        self,
+        batch: dict[str, Tensor],
+        action_prefix: Tensor | None = None,
+        delay: Tensor | None = None,
+        noise: Tensor | None = None,
+    ) -> Tensor:
         """Sample actions from the policy given environment observations.
+
+        Note: The provided action_prefix should NOT be normalized, as this method will handle normalization internally.
+        The action_prefix should have shape (batch_size, action_chunk_length, action_dim) where action_chunk_length is less than or equal to config.chunk_size.
 
         Args:
             batch: Batch of data containing environment observations.
+            action_prefix: Optional action prefix tensor of shape (batch_size, action_chunk_length, action_dim).
+            delay: Optional number of frozen delay actions from action_prefix.
             noise: Optional noise tensor.
-
         Returns:
-            The sampled actions tensor of shape (batch_size, action_dim).
+            The sampled actions tensor of shape (batch_size, action_chunk_length, action_dim).
         """
+        if not (torch.compiler.is_compiling() or torch.onnx.is_in_onnx_export()):
+            assert delay is None or 0 <= delay.item() <= self.config.max_delay, (
+                f"Delay must be None or between 0 and {self.config.max_delay}"
+            )
+            assert action_prefix is None or action_prefix.shape[1] == self.config.chunk_size, (
+                f"Action prefix must have {self.config.chunk_size} steps"
+            )
+
         batch = self.normalize_inputs(batch)
 
         images, img_masks = self.prepare_images(batch)
         lang_tokens, lang_masks = self.prepare_language(batch)
         tactile = batch.get("tactile")
+        
+        # if delay is not provided, set it to 0
+        if delay is None:
+            delay = torch.tensor(0, dtype=torch.long, device=lang_tokens.device)
+
+        if action_prefix is None:
+            # create a zero filled action_prefix
+            bsize = lang_tokens.shape[0]
+            actions_shape = (bsize, self.config.chunk_size, self.config.max_action_dim)
+            action_prefix = torch.zeros(actions_shape, dtype=lang_tokens.dtype, device=lang_tokens.device)
+        else:
+            # normalize action_prefix and pad chunk dimension to config.chunk_size
+            action_prefix = self.normalize_targets({"actions": action_prefix})["actions"]
+            action_prefix = F.pad(  # noop if chunk_size is already the same as action_prefix.shape[1]
+                action_prefix,
+                (0, 0, 0, self.config.chunk_size - action_prefix.shape[1]),
+            )
+
+        # if delay is not provided, set it to 0
+        if delay is None:
+            delay = torch.tensor(0, dtype=torch.long, device=lang_tokens.device)
+
+        if action_prefix is None:
+            # create a zero filled action_prefix
+            bsize = lang_tokens.shape[0]
+            actions_shape = (bsize, self.config.chunk_size, self.config.max_action_dim)
+            action_prefix = torch.zeros(actions_shape, dtype=lang_tokens.dtype, device=lang_tokens.device)
+        else:
+            # normalize action_prefix and pad chunk dimension to config.chunk_size
+            action_prefix = self.normalize_targets({"actions": action_prefix})["actions"]
+            action_prefix = F.pad(  # noop if chunk_size is already the same as action_prefix.shape[1]
+                action_prefix,
+                (0, 0, 0, self.config.chunk_size - action_prefix.shape[1]),
+            )
 
         actions = self.model.sample_actions(
             images,
@@ -633,6 +695,8 @@ class PI05Policy(PreTrainedPolicy):
             lang_tokens,
             lang_masks,
             tactile=tactile,
+            action_prefix,
+            delay,
             noise=noise,
         )
 
@@ -642,9 +706,6 @@ class PI05Policy(PreTrainedPolicy):
 
         actions = self.unnormalize_outputs({"actions": actions})["actions"]
 
-        # `self.model.forward` returns a (batch_size, n_action_steps, action_dim) tensor, but the queue
-        # effectively has shape (n_action_steps, batch_size, *), hence the transpose.
-        actions = actions.transpose(0, 1)
         return actions
 
     def forward(
@@ -661,7 +722,7 @@ class PI05Policy(PreTrainedPolicy):
             A dictionary containing the loss components ("MSE" and "CE").
         """
         batch = self.normalize_inputs(batch)
-        batch["discrete_actions"] = self.normalize_actions(dict(batch))["actions"]
+        batch["discrete_actions"] = self.normalize_discrete_actions(dict(batch))["actions"]
         batch = self.normalize_targets(batch)
 
         images, img_masks = self.prepare_images(
@@ -670,6 +731,11 @@ class PI05Policy(PreTrainedPolicy):
         lang_tokens, lang_masks = self.prepare_language(
             batch
         )  # in lang_masks we have True for real tokens and False for padded tokens
+        # response prediction is to predict the response . It will attend to image and language inputs.
+        response_tokens, response_masks = self.prepare_response(
+            batch
+        )  # in response_masks we have True for real tokens and False for padded tokens
+        # discrete actions are to predict actions using autoregressive technique and not flow matching. It will attend to image, language and response inputs.
         discrete_actions, discrete_action_masks = self.prepare_discrete_actions(
             batch
         )  # in discrete_action_masks we have True for real tokens and False for padded tokens
@@ -685,6 +751,9 @@ class PI05Policy(PreTrainedPolicy):
             lang_tokens,
             lang_masks,
             actions,
+            actions_is_pad,
+            response_tokens,
+            response_masks,
             tactile=tactile,
             noise=noise,
             time=time,
@@ -694,17 +763,8 @@ class PI05Policy(PreTrainedPolicy):
 
         mse_loss = losses["MSE"]
         ce_loss = losses["CE"]
-        if actions_is_pad is not None:
-            in_episode_bound = ~actions_is_pad
-            mse_loss = mse_loss * in_episode_bound.unsqueeze(-1)
 
-        # Remove padding
-        mse_loss = mse_loss[:, :, : self.config.max_action_dim]
-
-        # For backward pass
-        loss = mse_loss.mean()
-
-        return {"MSE": loss, "CE": ce_loss}
+        return {"MSE": mse_loss, "CE": ce_loss}
 
     def prepare_discrete_state(self, batch: dict[str, Tensor]) -> list[str]:
         """Discretizes the state into bins and converts it to a string representation.
@@ -724,13 +784,15 @@ class PI05Policy(PreTrainedPolicy):
             ValueError: If the state values are not normalized between -1 and 1.
         """
         state = batch["state"]
-        state_np = state.to(device="cpu", dtype=torch.float32).numpy()
-        if np.any(state_np < -1.0) or np.any(state_np > 1.0):
+        state_cpu = state.to(device="cpu", dtype=torch.float32)
+        if torch.any(state_cpu < -1.0) or torch.any(state_cpu > 1.0):
             logging.warning(
-                f"State values are not normalized between -1 and 1. Min: {state_np.min()}, Max: {state_np.max()}"
+                f"State values are not normalized between -1 and 1. Min: {state_cpu.min().item()}, Max: {state_cpu.max().item()}"
             )
-        state_np = np.clip(state_np, -1.0, 1.0)
-        discretized_states = np.digitize(state_np, bins=np.linspace(-1, 1, 256 + 1)[:-1]) - 1
+        state_clipped = torch.clamp(state_cpu, -1.0, 1.0)
+        # replicate np.digitize with torch for torch.compile compatibility
+        bin_indices = ((state_clipped + 1.0) * 128.0).long().clamp(0, 255)
+        discretized_states = bin_indices.cpu().tolist()
         return [
             " ".join(map(str, row)) for row in discretized_states
         ]  # TODO: return a tensor instead of a list of strings?
@@ -828,18 +890,25 @@ class PI05Policy(PreTrainedPolicy):
         device = batch["state"].device
         tasks = batch["prompt"]
 
-        # PaliGemma prompt has to end with a new line
-        tasks = [task if task.endswith("\n") else f"{task}\n" for task in tasks]
-
         # add state to the prompt
         state = self.prepare_discrete_state(batch)
-        prompt = [f"Task: {task}State: {state}\nActions:" for task, state in zip(tasks, state, strict=False)]
+        # using <eos> to separate each modality
+        if self.config.predict_response:
+            prompt = [
+                f"Task: {task}<eos>State: {state}<eos>Response:"
+                for task, state in zip(tasks, state, strict=False)
+            ]
+        else:
+            prompt = [
+                f"Task: {task}<eos>State: {state}<eos>Actions:"
+                for task, state in zip(tasks, state, strict=False)
+            ]
 
         tokenized_prompt = self.language_tokenizer.__call__(
             prompt,
             padding="max_length",
             padding_side="right",
-            max_length=self.config.tokenizer_max_length,
+            max_length=self.config.prompt_max_length,
             return_tensors="pt",
             truncation=True,
         )
@@ -847,6 +916,39 @@ class PI05Policy(PreTrainedPolicy):
         lang_masks = tokenized_prompt["attention_mask"].to(device=device, dtype=torch.bool)
 
         return lang_tokens, lang_masks
+
+    def prepare_response(self, batch: dict[str, Tensor]) -> tuple[Tensor, Tensor]:
+        """Tokenize the response input.
+
+        Args:
+            batch: Batch of data containing the key "response".
+
+        Returns:
+            A tuple containing:
+                - response_tokens: Tensor of response language tokens.
+                - response_masks: Tensor of response language attention masks.
+        """
+
+        if not self.config.predict_response:
+            return None, None
+        device = batch["state"].device
+        responses = batch["response"]
+
+        # if '' is found in response then response is not for loss calculation (used for robotic dataset with no subtask), so add pad token to the response.
+        response_prompt = [f"{response}<eos>Actions:" for response in responses]
+
+        tokenized_response = self.language_tokenizer.__call__(
+            response_prompt,
+            padding="max_length",
+            padding_side="right",
+            max_length=self.config.response_max_length,
+            return_tensors="pt",
+            truncation=True,
+        )
+        response_tokens = tokenized_response["input_ids"].to(device=device)
+        response_masks = tokenized_response["attention_mask"].to(device=device, dtype=torch.bool)
+
+        return response_tokens, response_masks
 
 
 class PI05FlowMatching(nn.Module):
@@ -926,6 +1028,8 @@ class PI05FlowMatching(nn.Module):
         self.time_mlp_in = nn.Linear(self.config.proj_width, self.config.proj_width)
         self.time_mlp_out = nn.Linear(self.config.proj_width, self.config.proj_width)
 
+        self.language_tokenizer = AutoTokenizer.from_pretrained("google/paligemma-3b-pt-224")
+
         self._init_model()
 
     def _init_weights(self, module: nn.Module) -> None:
@@ -1004,6 +1108,8 @@ class PI05FlowMatching(nn.Module):
         img_masks: list[Tensor],
         lang_tokens: Tensor,
         lang_masks: Tensor,
+        response_tokens: Tensor | None = None,
+        response_masks: Tensor | None = None,
         discrete_actions: Tensor | None = None,
         discrete_action_masks: Tensor | None = None,
     ) -> tuple[Tensor, Tensor, Tensor]:
@@ -1015,6 +1121,8 @@ class PI05FlowMatching(nn.Module):
             img_masks: List of image mask tensors.
             lang_tokens: Language token tensor.
             lang_masks: Language mask tensor.
+            response_tokens: Optional Response language token tensor.
+            response_masks: Optional Response language mask tensor.
             discrete_actions: Optional discrete action tensor.
             discrete_action_masks: Optional discrete action mask tensor.
 
@@ -1035,7 +1143,7 @@ class PI05FlowMatching(nn.Module):
             img_mask,
         ) in zip(images, img_masks, strict=False):
             img_emb = self.paligemma_with_expert.embed_image(img)
-            img_emb = img_emb.to(dtype=torch.bfloat16)
+            img_emb = img_emb.to(dtype=_preferred_dtype())
 
             # image embeddings don't need to be unnormalized because `fix/lerobot_openpi` branch of huggingface
             # already removed the normalization inside PaliGemma
@@ -1063,9 +1171,23 @@ class PI05FlowMatching(nn.Module):
         num_lang_embs = lang_emb.shape[1]
         att_masks += [0] * num_lang_embs
 
+        if response_tokens is not None:
+            response_emb = self.paligemma_with_expert.embed_language_tokens(response_tokens)
+
+            # Normalize response language embeddings
+            response_emb_dim = response_emb.shape[-1]
+            response_emb = response_emb * math.sqrt(response_emb_dim)
+
+            embs.append(response_emb)
+            pad_masks.append(response_masks)
+
+            # full attention between image, language and response inputs
+            num_response_embs = response_emb.shape[1]
+            att_masks += [1] * num_response_embs
+
         if discrete_actions is not None:
             discrete_action_emb = self.paligemma_with_expert.embed_discrete_actions(discrete_actions)
-            embs.append(discrete_action_emb.to(dtype=torch.bfloat16))
+            embs.append(discrete_action_emb.to(dtype=_preferred_dtype()))
             pad_masks.append(discrete_action_masks)
             att_masks += [1] * discrete_action_emb.shape[1]
 
@@ -1081,7 +1203,7 @@ class PI05FlowMatching(nn.Module):
 
         Args:
             noisy_actions: Tensor containing noisy actions.
-            timestep: Tensor containing timesteps.
+            timestep: Tensor containing timesteps of shape (batch_size, action_chunk_length).
 
         Returns:
             A tuple containing:
@@ -1095,7 +1217,7 @@ class PI05FlowMatching(nn.Module):
         att_masks = []
 
         bsize = noisy_actions.shape[0]
-        dtype = torch.bfloat16
+        dtype = _preferred_dtype()
         device = noisy_actions.device
 
         # Embed timestep using sine-cosine positional encoding with sensitivity in the range [0, 1]
@@ -1154,6 +1276,9 @@ class PI05FlowMatching(nn.Module):
         lang_masks: Tensor,
         actions: Tensor,
         tactile: Tensor | None = None,
+        actions_is_pad: Tensor | None = None,
+        response_tokens: Tensor | None = None,
+        response_masks: Tensor | None = None,
         noise: Tensor | None = None,
         time: Tensor | None = None,
         discrete_actions: Tensor | None = None,
@@ -1166,7 +1291,10 @@ class PI05FlowMatching(nn.Module):
             img_masks: List of image mask tensors.
             lang_tokens: Language token tensor.
             lang_masks: Language mask tensor.
+            response_tokens: Response language token tensor.
+            response_masks: Response language mask tensor.
             actions: Action tensor.
+            actions_is_pad: Optional action is padded mask tensor.
             noise: Optional noise tensor.
             time: Optional time tensor.
             discrete_actions: Optional discrete action tensor.
@@ -1177,12 +1305,20 @@ class PI05FlowMatching(nn.Module):
         """
         # Run VLM first to get key value cache
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
-            images, img_masks, lang_tokens, lang_masks, discrete_actions, discrete_action_masks
+            images,
+            img_masks,
+            lang_tokens,
+            lang_masks,
+            response_tokens,
+            response_masks,
+            discrete_actions,
+            discrete_action_masks,
         )
 
         vlm_2d_attention_mask = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
         vlm_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
 
+        # avoids using discrete action for predicting continuous flow matching action
         num_cross_att_tokens = prefix_embs.shape[1] - self.config.discrete_action_max_length
 
         (prefix_out, _), past_key_values = self.paligemma_with_expert.forward(
@@ -1191,18 +1327,29 @@ class PI05FlowMatching(nn.Module):
             past_key_values=None,
             inputs_embeds=[prefix_embs, None],
             n_cross_att_tokens=num_cross_att_tokens,
-            use_cache=True,
+            use_cache=False,
             fill_kv_cache=True,
         )
 
         # Now run action expert
+        batch_size = actions.shape[0]
         if noise is None:
             noise = self.sample_noise(actions.shape, actions.device)
 
         if time is None:
-            time = self.sample_time(actions.shape[0], actions.device)
+            time = self.sample_time(batch_size, actions.device)
 
-        time_expanded = time[:, None, None]
+        # handle real time inference delay
+        delay = torch.randint(0, self.config.max_delay + 1, (batch_size,))
+        prefix_mask = rearrange(torch.arange(self.config.chunk_size), "c -> 1 c") < rearrange(
+            delay, "b -> b 1"
+        )
+        prefix_mask = prefix_mask.to(device=actions.device)
+        time = torch.where(
+            prefix_mask, 0, rearrange(time, "b -> b 1")
+        )  # using diffusion time 0 instead of flow matching time 1
+
+        time_expanded = rearrange(time, "b c -> b c 1")
         x_t = time_expanded * noise + (1 - time_expanded) * actions
         u_t = noise - actions
 
@@ -1215,7 +1362,7 @@ class PI05FlowMatching(nn.Module):
             n_cross_att_tokens=num_cross_att_tokens,
             cross_att_pad_masks=prefix_pad_masks[:, :num_cross_att_tokens],
         )
-        # We should skip the response tokens when numbering the position ids for the action expert
+        # We should skip the discrete action tokens when numbering the position ids for the action expert
         prefix_offsets = torch.sum(prefix_pad_masks[:, : -self.config.discrete_action_max_length], dim=-1)[
             :, None
         ]  # action expert position ids start after prefix
@@ -1242,28 +1389,87 @@ class PI05FlowMatching(nn.Module):
         v_t = self.action_out_proj(suffix_out)
         v_t = v_t.to(dtype=torch.float32)
 
-        losses = F.mse_loss(u_t, v_t, reduction="none")
+        mse_loss = F.mse_loss(u_t, v_t, reduction="none")
+
+        # mask out frozen actions and padded actions
+        postfix_mask = rearrange(
+            torch.logical_not(prefix_mask), "b c -> b c 1"
+        )  # 0 for frozen actions, 1 for non-frozen actions
+
+        if actions_is_pad is not None:
+            in_episode_bound = ~actions_is_pad
+            in_episode_bound = rearrange(
+                in_episode_bound, "b c -> b c 1"
+            )  # 0 for padded actions, 1 for non-padded actions
+            postfix_mask = torch.logical_and(postfix_mask, in_episode_bound)
+
+        mse_loss = mse_loss * postfix_mask
+
+        # Remove padding
+        mse_loss = mse_loss[:, :, : self.config.max_action_dim]
+
+        # Do not include frozen actions and padded actions in the mean loss calculation
+        postfix_mask_expanded = repeat(postfix_mask, "b c 1 -> b c d", d=mse_loss.shape[-1])
+        mse_loss = mse_loss.sum() / (postfix_mask_expanded.sum() + 1e-8)
 
         # compute cross entropy loss for discrete actions
         batch_size, seq_len = discrete_actions.shape
-        discrete_action_out = prefix_out[:, -self.config.discrete_action_max_length - 1 : -1]
+        discrete_token_start = -self.config.discrete_action_max_length
+        # The last token of response will predict the first token of discrete actions , so we need to slice from discrete_token_start -1.
+        # The predicted last token of discrete action is useless, so no need to include for loss calculation.
+        discrete_action_slice_object = slice(discrete_token_start - 1, -1)
+        discrete_action_out = prefix_out[:, discrete_action_slice_object]
         logits = self.paligemma_with_expert.da_head(discrete_action_out)
 
         logits = logits.to(dtype=torch.float32)  # upcast to float32 for loss calculation
         logits = rearrange(logits, "b s d -> (b s) d")
         labels = rearrange(discrete_actions, "b s -> (b s)")
-        ce_loss = F.cross_entropy(logits, labels, reduction="none")
+        discrete_action_ce_loss = F.cross_entropy(logits, labels, reduction="none")
 
-        ce_loss = rearrange(ce_loss, "(b s) -> b s", b=batch_size, s=seq_len)
+        discrete_action_ce_loss = rearrange(discrete_action_ce_loss, "(b s) -> b s", b=batch_size, s=seq_len)
 
         # remove pad tokens
         discrete_action_is_pad = ~discrete_action_masks  # convert into format where value for pad is True
-        ce_loss = ce_loss * ~discrete_action_is_pad
+        discrete_action_ce_loss = discrete_action_ce_loss * ~discrete_action_is_pad
 
         # compute mean
-        ce_loss = ce_loss.mean()
+        discrete_action_ce_loss = discrete_action_ce_loss.mean()
 
-        return {"MSE": losses, "CE": ce_loss}
+        # compute cross entropy loss for response language only when pedict_response is set to true
+        if self.config.predict_response:
+            batch_size, seq_len = response_tokens.shape
+            response_token_start = -self.config.response_max_length - self.config.discrete_action_max_length
+            # The last token of language will predict <BOS> token of response, so no need to include for loss calculation. Hence slice starts from -self.config.discrete_action_max_length - self.config.response_max_length.
+            # The last token of response predicts first token  of discrete actions, so no need to include for loss calculation. Hence slice ends at -self.config.discrete_action_max_length - 1.
+            response_token_end = -self.config.discrete_action_max_length - 1
+            response_slice_object = slice(response_token_start, response_token_end)
+            response_out = prefix_out[
+                :,
+                response_slice_object,
+            ]
+            response_logits = self.paligemma_with_expert.paligemma.lm_head(response_out)
+            # response slice to exclude the <BOS> token from response while calculating loss.
+            response_slice = slice(1, None)
+            response_logits = response_logits.to(
+                dtype=torch.float32
+            )  # upcast to float32 for loss calculation
+            response_logits = rearrange(response_logits, "b s d -> (b s) d")
+            response_labels = rearrange(response_tokens[:, response_slice], "b s -> (b s)")
+            response_ce_loss = F.cross_entropy(response_logits, response_labels, reduction="none")
+
+            response_ce_loss = rearrange(response_ce_loss, "(b s) -> b s", b=batch_size, s=seq_len - 1)
+
+            # remove pad tokens
+            response_is_pad = ~response_masks  # convert into format where value for pad is True
+            # helps to control loss for response tokens in case of robotic data and VQA data
+            response_ce_loss = response_ce_loss * ~response_is_pad[:, response_slice]
+
+            # compute mean
+            response_ce_loss = response_ce_loss.mean()
+        else:
+            response_ce_loss = torch.tensor(0.0, device=mse_loss.device)
+
+        return {"MSE": mse_loss, "CE": discrete_action_ce_loss + response_ce_loss}
 
     def sample_actions(
         self,
@@ -1272,6 +1478,8 @@ class PI05FlowMatching(nn.Module):
         lang_tokens: Tensor,
         lang_masks: Tensor,
         tactile: Tensor | None = None,
+        action_prefix: Tensor,
+        delay: Tensor,
         noise: Tensor | None = None,
     ) -> Tensor:
         """Do a full inference forward and compute the action.
@@ -1281,8 +1489,9 @@ class PI05FlowMatching(nn.Module):
             img_masks: List of image mask tensors.
             lang_tokens: Language token tensor.
             lang_masks: Language mask tensor.
+            action_prefix: Action prefix tensor.
+            delay: Number of delay actions, aka number of actions frozen from the action_prefix.
             noise: Optional noise tensor.
-
         Returns:
             The sampled action tensor.
         """
@@ -1290,7 +1499,7 @@ class PI05FlowMatching(nn.Module):
         device = lang_tokens.device
 
         if noise is None:
-            actions_shape = (bsize, self.config.n_action_steps, self.config.max_action_dim)
+            actions_shape = (bsize, self.config.chunk_size, self.config.max_action_dim)
             noise = self.sample_noise(actions_shape, device)
 
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
@@ -1299,37 +1508,72 @@ class PI05FlowMatching(nn.Module):
         prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
         prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
 
+        prefix_offsets = torch.sum(prefix_pad_masks, dim=-1)[:, None] - 1
+
         num_cross_att_tokens = prefix_embs.shape[1]
 
         # Compute image and language key value cache
-        _, past_key_values = self.paligemma_with_expert.forward(
+        (prefix_out, _), past_key_values = self.paligemma_with_expert.forward(
             attention_mask=prefix_att_2d_masks,
             position_ids=prefix_position_ids,
             past_key_values=None,
             inputs_embeds=[prefix_embs, None],
             n_cross_att_tokens=num_cross_att_tokens,
-            use_cache=self.config.use_cache,
+            use_cache=False,
             fill_kv_cache=True,
         )
 
+        # initialize response tokens to empty tensor for storing response tokens during inference
+        response_tokens = torch.empty((bsize, 0), device=device, dtype=torch.long)
+        # if response prediction is enabled, then predict response tokens autoregressively
+        if self.config.predict_response:
+            for auto_step in range(self.config.response_max_length):
+                (
+                    prefix_out,
+                    prefix_embs,
+                    prefix_pad_masks,
+                    prefix_att_masks,
+                    prefix_offsets,
+                    response_tokens,
+                    past_key_values,
+                ) = self.infer_response(
+                    prefix_out,
+                    prefix_embs,
+                    prefix_pad_masks,
+                    prefix_att_masks,
+                    past_key_values,
+                    prefix_offsets,
+                    response_tokens,
+                    auto_step,
+                    bsize,
+                    device,
+                )
+
+        # perform denoising steps to get the action
         dt = -1.0 / self.config.num_steps
         dt = torch.tensor(dt, dtype=torch.float32, device=device)
 
         x_t = noise
         time = torch.tensor(1.0, dtype=torch.float32, device=device)
+        prefix_mask = rearrange(torch.arange(self.config.chunk_size, device=device), "c -> 1 c") < delay
         while time >= -dt / 2:
-            expanded_time = time.expand(bsize)
+            # if delay is greater than 0, then freeze the action prefix at the beginning of action chunk
+            x_t = torch.where(rearrange(prefix_mask, "b c -> b c 1"), action_prefix, x_t)
+            masked_time = torch.where(prefix_mask, 0, time)
             v_t = self.denoise_step(
                 prefix_pad_masks,
                 past_key_values,
                 x_t,
-                expanded_time,
+                masked_time,
                 tactile=tactile,
             )
 
             # Euler step
             x_t += dt * v_t
             time += dt
+
+        # we need to ensure the frozen actions are not modified before returning the denoised actions
+        x_t = torch.where(rearrange(prefix_mask, "b c -> b c 1"), action_prefix, x_t)
         return x_t
 
     def denoise_step(
@@ -1337,7 +1581,7 @@ class PI05FlowMatching(nn.Module):
         prefix_pad_masks: Tensor,
         past_key_values: list[dict[str, Tensor]],
         x_t: Tensor,
-        timestep: Tensor,
+        time: Tensor,
         tactile: Tensor | None = None,
     ) -> Tensor:
         """Apply one denoising step of the noise `x_t` at a given timestep.
@@ -1346,12 +1590,11 @@ class PI05FlowMatching(nn.Module):
             prefix_pad_masks: Prefix padding masks.
             past_key_values: Past key values from the VLM.
             x_t: Current noise tensor.
-            timestep: Current timestep.
-
+            time: Time tensor of shape (batch_size, action_chunk_length).
         Returns:
             The predicted velocity tensor (v_t).
         """
-        suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(x_t, timestep)
+        suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(x_t, time)
         suffix_embs = self.cross_attend_tactile(suffix_embs, tactile)
 
         num_cross_att_tokens = prefix_pad_masks.shape[1]
@@ -1361,8 +1604,7 @@ class PI05FlowMatching(nn.Module):
             n_cross_att_tokens=num_cross_att_tokens,
             cross_att_pad_masks=prefix_pad_masks[:, :num_cross_att_tokens],
         )
-        # We should skip the response tokens when numbering the position ids for the action expert
-        prefix_offsets = torch.sum(prefix_pad_masks[:, : -self.config.discrete_action_max_length], dim=-1)[
+        prefix_offsets = torch.sum(prefix_pad_masks, dim=-1)[
             :, None
         ]  # action expert position ids start after prefix
         action_expert_position_ids = prefix_offsets + torch.cumsum(suffix_pad_masks, dim=1) - 1
@@ -1381,3 +1623,119 @@ class PI05FlowMatching(nn.Module):
         v_t = self.action_out_proj(suffix_out)
         v_t = v_t.to(dtype=torch.float32)
         return v_t
+
+    def infer_response(
+        self,
+        prefix_out: Tensor,
+        prefix_embs: Tensor,
+        prefix_pad_masks: Tensor,
+        prefix_att_masks: Tensor,
+        past_key_values: list[dict[str, Tensor]],
+        prefix_offsets: Tensor,
+        response_tokens: Tensor,
+        auto_step: int,
+        bsize: int,
+        device: torch.device,
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, list[dict[str, Tensor]], Tensor]:
+        """Perform autoregressive inference for response generation.
+
+        This method generates the next token in the response sequence, updating the
+        various state tensors required for maintaining the generation context. It handles
+        the initial BOS token generation as well as subsequent tokens, and manages
+        padding masks to handle variable-length sequences properly.
+
+        Args:
+            prefix_out: Output tensor from the previous step.
+            prefix_embs: Embeddings for the current prefix context.
+            prefix_pad_masks: Boolean mask indicating valid (non-padding) tokens in the prefix.
+            prefix_att_masks: Attention mask for the prefix.
+            past_key_values: KV cache from previous transformer steps.
+            prefix_offsets: Position offsets for the current generation step.
+            response_tokens: Accumulated tokens generated so far.
+            auto_step: Current autoregressive step index (0 for first token).
+            bsize: Batch size.
+            device: Device to run the computation on.
+
+        Returns:
+            A tuple containing updated tensors for the next step:
+            (prefix_out, prefix_embs, prefix_pad_masks, prefix_att_masks,
+             prefix_offsets, response_tokens, past_key_values, response_token)
+        """
+        EOS_TOKEN = self.language_tokenizer.convert_tokens_to_ids(self.language_tokenizer.eos_token)  # noqa: N806
+        if auto_step == 0:
+            # Start the autoregressive inference with <bos> token
+            response_token = torch.full(
+                (bsize, 1),
+                self.language_tokenizer.bos_token_id,
+                device=device,
+                dtype=torch.long,
+            )
+        else:
+            # get the last predicted token from the prefix output which is predicted response
+            response_token = prefix_out[:, -1:]
+            response_token = self.paligemma_with_expert.paligemma.lm_head(response_token).argmax(dim=-1)
+
+        PAD_TOKEN = self.language_tokenizer.pad_token_id  # noqa: N806
+        # Create pad masks: False if previous token was EOS or PAD
+        if response_tokens.shape[1] > 1:
+            prev_tokens = response_tokens
+            has_eos = (prev_tokens == EOS_TOKEN).any(dim=1, keepdim=True)
+            has_pad = (prev_tokens == PAD_TOKEN).any(dim=1, keepdim=True)
+            # check if the previous token was EOS or PAD. If so, then the current token should be padded, so its not attended by flow matching action expert.
+            response_pad_masks = ~(has_eos | has_pad)
+            response_token = torch.where(
+                response_pad_masks,
+                response_token,
+                torch.tensor(PAD_TOKEN, device=device, dtype=response_token.dtype),
+            )
+        else:
+            response_pad_masks = torch.ones((bsize, 1), device=device, dtype=torch.bool)
+
+        # Updating response tokens with current predicted token
+        response_tokens = torch.cat([response_tokens, response_token], dim=1)
+
+        # Embed the current predicted token
+        response_emb = self.paligemma_with_expert.embed_language_tokens(response_token)
+
+        # Normalize response language embeddings
+        response_emb_dim = response_emb.shape[-1]
+        response_emb = response_emb * math.sqrt(response_emb_dim)
+
+        response_att_masks = torch.ones((bsize, 1), device=device, dtype=response_emb.dtype)
+
+        # update the prefix embs, pad masks and att masks, so it can be used by action experts
+        prefix_embs = torch.cat([prefix_embs, response_emb], dim=1)
+        prefix_pad_masks = torch.cat([prefix_pad_masks, response_pad_masks], dim=1)
+        prefix_att_masks = torch.cat([prefix_att_masks, response_att_masks], dim=1)
+
+        num_cross_att_tokens = prefix_pad_masks.shape[1]
+        # create the attention mask for the response tokens
+        response_att_2d_masks = make_att_2d_masks(
+            response_pad_masks,
+            response_att_masks,
+            n_cross_att_tokens=num_cross_att_tokens - 1,
+            cross_att_pad_masks=prefix_pad_masks[:, : num_cross_att_tokens - 1],
+        )
+        prefix_offsets = prefix_offsets + response_pad_masks.long()
+        prefix_position_ids = prefix_offsets
+
+        # Compute image and language key value cache
+        (prefix_out, _), past_key_values = self.paligemma_with_expert.forward(
+            attention_mask=response_att_2d_masks,
+            position_ids=prefix_position_ids,
+            past_key_values=past_key_values,
+            inputs_embeds=[response_emb, None],
+            n_cross_att_tokens=num_cross_att_tokens,
+            use_cache=True,
+            fill_kv_cache=True,
+        )
+
+        return (
+            prefix_out,
+            prefix_embs,
+            prefix_pad_masks,
+            prefix_att_masks,
+            prefix_offsets,
+            response_tokens,
+            past_key_values,
+        )

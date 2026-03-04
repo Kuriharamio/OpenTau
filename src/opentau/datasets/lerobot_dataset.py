@@ -52,8 +52,8 @@ Classes:
         Metadata manager for LeRobot datasets with Hub integration, version
         checking, and statistics loading.
 
-    GroundingDatasetMetadata
-        Metadata manager for grounding datasets.
+    VQADatasetMetadata
+        Metadata manager for vqa datasets.
 
     BaseDataset
         Base PyTorch Dataset class with common functionality.
@@ -108,7 +108,7 @@ from opentau.configs.train import TrainPipelineConfig
 from opentau.constants import HF_OPENTAU_HOME
 from opentau.datasets.compute_stats import aggregate_stats, compute_episode_stats
 from opentau.datasets.image_writer import AsyncImageWriter, write_image
-from opentau.datasets.standard_data_format_mapping import DATA_FEATURES_NAME_MAPPING, LOSS_TYPE_MAPPING
+from opentau.datasets.standard_data_format_mapping import DATA_FEATURES_NAME_MAPPING
 from opentau.datasets.utils import (
     DEFAULT_FEATURES,
     DEFAULT_IMAGE_PATH,
@@ -150,6 +150,7 @@ from opentau.policies.value.configuration_value import ValueConfig
 from opentau.policies.value.reward import (
     calculate_return_bins_with_equal_width,
 )
+from opentau.utils.accelerate_utils import get_proc_accelerator
 from opentau.utils.utils import on_accelerate_main_proc
 
 
@@ -258,8 +259,8 @@ class DatasetMetadata:
         return {key: tuple(ft["shape"]) for key, ft in self.features.items()}
 
 
-class GroundingDatasetMetadata(DatasetMetadata):
-    """Metadata class for grounding datasets (vision-language datasets)."""
+class VQADatasetMetadata(DatasetMetadata):
+    """Metadata class for vqa datasets (vision-language datasets)."""
 
     pass
 
@@ -324,8 +325,17 @@ class LeRobotDatasetMetadata(DatasetMetadata):
             if is_valid_version(self.revision):
                 self.revision = get_safe_version(self.repo_id, self.revision)
 
-            (self.root / "meta").mkdir(exist_ok=True, parents=True)
-            self.pull_from_repo(allow_patterns="meta/")
+            # In distributed training, only rank 0 downloads to avoid race conditions
+            # where other ranks read metadata before the download has finished.
+            acc = get_proc_accelerator()
+            if acc is not None and acc.num_processes > 1:
+                if acc.is_main_process:
+                    (self.root / "meta").mkdir(exist_ok=True, parents=True)
+                    self.pull_from_repo(allow_patterns="meta/")
+                acc.wait_for_everyone()
+            else:
+                (self.root / "meta").mkdir(exist_ok=True, parents=True)
+                self.pull_from_repo(allow_patterns="meta/")
             self.load_metadata()
 
     def load_metadata(self) -> None:
@@ -575,7 +585,7 @@ class BaseDataset(torch.utils.data.Dataset):
     """Base class for all robot learning datasets.
 
     This abstract base class provides common functionality for both LeRobotDataset
-    and GroundingDataset, including data format standardization, image processing,
+    and VQADataset, including data format standardization, image processing,
     and vector padding. It ensures all datasets conform to a standard format
     regardless of their source or structure.
 
@@ -724,21 +734,10 @@ class BaseDataset(torch.utils.data.Dataset):
         standard_item["img_is_pad"] = torch.tensor(img_is_pad, dtype=torch.bool)
         standard_item["action_is_pad"] = item[name_map["actions"] + "_is_pad"]
 
-        # add loss type
-        standard_item["loss_type"] = LOSS_TYPE_MAPPING[self._get_feature_mapping_key()]
-
         # cast all tensors in standard_item to bfloat16
         for key, value in standard_item.items():
             if isinstance(value, torch.Tensor) and value.dtype.is_floating_point:
                 standard_item[key] = value.to(dtype=torch.bfloat16)
-
-        # ensure that non-empty strings contain exactly one newline character at the end of the string
-        for key in ["prompt", "response"]:
-            if standard_item[key].endswith(
-                "\n"
-            ):  # ensure there isn't going to be an extra space at the end after calling replace
-                standard_item[key] = standard_item[key][:-1]
-            standard_item[key] = standard_item[key].replace("\n", " ") + "\n"
 
         return standard_item
 
@@ -1720,7 +1719,9 @@ class LeRobotDataset(BaseDataset):
 
         self._wait_image_writer()
         self._save_episode_table(episode_buffer, episode_index)
-        ep_stats = compute_episode_stats(episode_buffer, self.features)
+        ep_stats = compute_episode_stats(
+            episode_buffer, self.features, skip_video_stats=getattr(self, "skip_video_stats", False)
+        )
 
         if len(self.meta.video_keys) > 0:
             video_paths = self.encode_episode_videos(episode_index)
@@ -1732,19 +1733,31 @@ class LeRobotDataset(BaseDataset):
 
         ep_data_index, _ = get_episode_data_index(self.meta.episodes, [episode_index])
         ep_data_index_np = {k: t.numpy() for k, t in ep_data_index.items()}
+        timestamps = np.asarray(episode_buffer["timestamp"]).reshape(-1)
+        episode_indices = np.full(episode_length, episode_index)
         check_timestamps_sync(
-            episode_buffer["timestamp"],
-            episode_buffer["episode_index"],
+            timestamps,
+            episode_indices,
             ep_data_index_np,
             self.fps,
             self.tolerance_s,
         )
 
-        video_files = list(self.root.rglob("*.mp4"))
-        assert len(video_files) == self.num_episodes * len(self.meta.video_keys)
+        expected_episodes = self.meta.total_episodes
+        missing_videos: list[str] = []
+        for ep_idx in range(expected_episodes):
+            for vid_key in self.meta.video_keys:
+                video_path = self.root / self.meta.get_video_file_path(ep_idx, vid_key)
+                if not video_path.is_file():
+                    missing_videos.append(str(video_path))
+        assert not missing_videos, "Missing expected encoded videos:\n" + "\n".join(missing_videos)
 
-        parquet_files = list(self.root.rglob("*.parquet"))
-        assert len(parquet_files) == self.num_episodes
+        missing_parquet: list[str] = []
+        for ep_idx in range(expected_episodes):
+            parquet_path = self.root / self.meta.get_data_file_path(ep_idx)
+            if not parquet_path.is_file():
+                missing_parquet.append(str(parquet_path))
+        assert not missing_parquet, "Missing expected parquet episode files:\n" + "\n".join(missing_parquet)
 
         # delete images
         img_dir = self.root / "images"
@@ -1920,6 +1933,7 @@ class LeRobotDataset(BaseDataset):
         image_resample_strategy: str = "nearest",
         vector_resample_strategy: str = "nearest",
         standardize: bool = True,
+        skip_video_stats: bool = False,
     ) -> "LeRobotDataset":
         """Create a LeRobot Dataset from scratch in order to record data."""
         obj = cls.__new__(cls)
@@ -1953,5 +1967,6 @@ class LeRobotDataset(BaseDataset):
         obj.image_resample_strategy = image_resample_strategy
         obj.vector_resample_strategy = vector_resample_strategy
         obj.standardize = standardize
+        obj.skip_video_stats = skip_video_stats
         obj.episode_data_index, obj.epi2idx = get_episode_data_index(obj.meta.episodes, obj.episodes)
         return obj

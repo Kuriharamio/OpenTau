@@ -25,11 +25,10 @@ action generation and conditioning.
 import math
 
 import torch
-import torch.version
-from pytest import Cache
 from torch import nn
 from transformers import (
     AutoConfig,
+    Cache,
     GemmaForCausalLM,
     PaliGemmaForConditionalGeneration,
     PretrainedConfig,
@@ -70,6 +69,10 @@ class LoRALinear(nn.Module):
         base_out = self.base_layer(x)
         lora_out = self.lora_B(self.lora_A(self.dropout(x)))
         return base_out + self.scaling * lora_out
+
+
+def _preferred_dtype():
+    return torch.float32 if torch.onnx.is_in_onnx_export() else torch.bfloat16
 
 
 def apply_rope(x: torch.Tensor, positions: torch.Tensor, max_wavelength: int = 10_000) -> torch.Tensor:
@@ -299,7 +302,8 @@ class PaliGemmaWithExpertModel(PreTrainedModel):
         if self.config.enable_lora:
             self._apply_lora_to_attention_projections()
 
-        self.to_bfloat16_like_physical_intelligence()
+        if not torch.compiler.is_compiling():  # Only cast to bfloat16 if not compiling
+            self.to_bfloat16_like_physical_intelligence()
         self.set_requires_grad()
 
     def _wrap_linear_with_lora(self, module: nn.Module, attr_name: str) -> bool:
@@ -343,6 +347,13 @@ class PaliGemmaWithExpertModel(PreTrainedModel):
             self.paligemma.eval()
             for params in self.paligemma.parameters():
                 params.requires_grad = False
+            for param in self.da_head.parameters():
+                param.requires_grad = False
+            for param in self.discrete_action_embedding.parameters():
+                param.requires_grad = False
+                
+        if self.config.stage2_tactile_finetune:
+            self.set_trainable_for_tactile_finetune()
 
         if self.config.stage2_tactile_finetune:
             self.set_trainable_for_tactile_finetune()
@@ -484,7 +495,7 @@ class PaliGemmaWithExpertModel(PreTrainedModel):
                 input_shape = hidden_states.shape[:-1]
                 hidden_shape = (*input_shape, -1, layer.self_attn.head_dim)
 
-                hidden_states = hidden_states.to(dtype=torch.bfloat16)
+                hidden_states = hidden_states.to(dtype=_preferred_dtype())
                 query_state = layer.self_attn.q_proj(hidden_states).view(hidden_shape)
                 key_state = layer.self_attn.k_proj(hidden_states).view(hidden_shape)
                 value_state = layer.self_attn.v_proj(hidden_states).view(hidden_shape)
@@ -502,33 +513,29 @@ class PaliGemmaWithExpertModel(PreTrainedModel):
             query_states = apply_rope(query_states, position_ids)
             key_states = apply_rope(key_states, position_ids)
 
-            if use_cache and past_key_values is None:
-                past_key_values = {}
-
             if use_cache:
-                if fill_kv_cache:
-                    if n_cross_att_tokens is None:
-                        raise ValueError("n_cross_att_tokens must be provided when fill_kv_cache is True")
-                    past_key_values[layer_idx] = {
-                        # save the first n_cross_att_tokens for action expert cross attention
-                        "key_states": key_states[:, :n_cross_att_tokens, :, :],
-                        "value_states": value_states[:, :n_cross_att_tokens, :, :],
-                    }
-                else:
-                    # TODO here, some optimization can be done - similar to a `StaticCache` we can declare the `max_len` before.
-                    # so we create an empty cache, with just one cuda malloc, and if (in autoregressive case) we reach
-                    # the max len, then we (for instance) double the cache size. This implementation already exists
-                    # in `transformers`. (molbap)
-                    key_states = torch.cat([key_states, past_key_values[layer_idx]["key_states"]], dim=1)
-                    value_states = torch.cat(
-                        [value_states, past_key_values[layer_idx]["value_states"]], dim=1
-                    )
+                # TODO here, some optimization can be done - similar to a `StaticCache` we can declare the `max_len` before.
+                # so we create an empty cache, with just one cuda malloc, and if (in autoregressive case) we reach
+                # the max len, then we (for instance) double the cache size. This implementation already exists
+                # in `transformers`. (molbap)
+                key_states = torch.cat([past_key_values[layer_idx]["key_states"], key_states], dim=1)
+                value_states = torch.cat([past_key_values[layer_idx]["value_states"], value_states], dim=1)
+            if fill_kv_cache:
+                if past_key_values is None:
+                    past_key_values = {}
+                if n_cross_att_tokens is None:
+                    raise ValueError("n_cross_att_tokens must be provided when fill_kv_cache is True")
+                past_key_values[layer_idx] = {
+                    # save the first n_cross_att_tokens for action expert cross attention
+                    "key_states": key_states[:, :n_cross_att_tokens, :, :],
+                    "value_states": value_states[:, :n_cross_att_tokens, :, :],
+                }
 
             attention_interface = self.get_attention_interface()
             att_output = attention_interface(
                 attention_mask, batch_size, head_dim, query_states, key_states, value_states
             )
-            att_output = att_output.to(dtype=torch.bfloat16)
+            att_output = att_output.to(dtype=_preferred_dtype())
 
             # first part of att_output is prefix (up to sequence length, [:, 0:prefix_seq_len])
             outputs_embeds = []

@@ -24,7 +24,7 @@ import pytest
 import torch
 from PIL import Image
 
-from opentau import available_grounding_datasets
+from opentau import available_vqa_datasets
 from opentau.datasets.factory import make_dataset
 from opentau.datasets.image_writer import image_array_to_pil_image
 from opentau.datasets.lerobot_dataset import (
@@ -310,7 +310,6 @@ def check_standard_data_format(item, delta_timestamps_params, dataset, train_pip
         ("actions", (train_pipeline_config.action_chunk, train_pipeline_config.max_action_dim)),
         ("prompt", None),
         ("response", None),
-        ("loss_type", None),
         ("img_is_pad", (train_pipeline_config.num_cams,)),
         ("action_is_pad", (train_pipeline_config.action_chunk,)),
     ]
@@ -329,7 +328,7 @@ def check_standard_data_format(item, delta_timestamps_params, dataset, train_pip
             assert item[key].shape == shape, f"{key}"
         elif key == "state" or key == "actions":
             assert item[key].shape == shape, f"{key}"
-        elif key == "prompt" or key == "response" or key == "loss_type":
+        elif key == "prompt" or key == "response":
             assert type(item[key]) is str, f"{key}"
         elif key == "img_is_pad" or key == "action_is_pad":
             assert item[key].shape == shape, f"{key}"
@@ -356,7 +355,7 @@ def test_lerobot_dataset_factory(dataset_config, train_pipeline_config, repo_id)
         - we can create a dataset with the factory.
         - for a commonly used set of data keys, the data dimensions are correct.
     """
-    dataset_config.grounding = None
+    dataset_config.vqa = None
     dataset_config.repo_id = repo_id
     dataset_config.root = None
     dataset_config.revision = None
@@ -383,7 +382,7 @@ def test_do_not_use_imagenet_stats(dataset_config, train_pipeline_config, repo_i
         - we can create a dataset with the factory.
         - for a commonly used set of data keys, the data dimensions are correct.
     """
-    dataset_config.grounding = None
+    dataset_config.vqa = None
     dataset_config.repo_id = repo_id
     dataset_config.root = None
     dataset_config.revision = None
@@ -438,6 +437,6 @@ def test_dataset_feature_with_forward_slash_raises_error():
         )
 
 
-def test_grounding_dataset_imports():
-    for dataset in available_grounding_datasets:
-        import_module(f"opentau.datasets.grounding.{dataset}")
+def test_vqa_dataset_imports():
+    for dataset in available_vqa_datasets:
+        import_module(f"opentau.datasets.vqa.{dataset}")

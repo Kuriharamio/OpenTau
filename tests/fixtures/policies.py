@@ -62,11 +62,12 @@ def value_function_training_config(train_pipeline_config: TrainPipelineConfig) -
         n_obs_steps=1,
         normalization_mapping={
             "VISUAL": NormalizationMode.IDENTITY,
-            "STATE": NormalizationMode.MEAN_STD,
+            "STATE": NormalizationMode.MIN_MAX,
             "VALUE": NormalizationMode.MEAN_STD,
         },
         max_state_dim=32,
-        tokenizer_max_length=52,
+        prompt_max_length=256,
+        response_max_length=52,
         reward_config=RewardConfig(
             number_of_bins=201,
             C_neg=-1000.0,
@@ -82,7 +83,7 @@ def value_function_training_config(train_pipeline_config: TrainPipelineConfig) -
 
     cfg.dataset_mixture.datasets = [
         DatasetConfig(repo_id="lerobot/droid_100", episodes=[0]),
-        DatasetConfig(grounding="clevr"),
+        DatasetConfig(vqa="clevr"),
     ]
     cfg.dataset_mixture.weights = [1.0, 1.0]
     cfg.resolution = (224, 224)
@@ -126,10 +127,11 @@ def pi05_training_config(train_pipeline_config: TrainPipelineConfig) -> TrainPip
             "STATE": NormalizationMode.MIN_MAX,
             "ACTION": NormalizationMode.MEAN_STD,
         },
+        predict_response=True,
     )
     cfg.dataset_mixture.datasets = [
         DatasetConfig(repo_id="lerobot/droid_100", episodes=[0]),
-        DatasetConfig(grounding="clevr"),
+        DatasetConfig(vqa="clevr"),
     ]
     cfg.dataset_mixture.weights = [1.0, 1.0]
     cfg.resolution = (224, 224)

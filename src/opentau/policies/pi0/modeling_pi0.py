@@ -25,6 +25,7 @@ from collections import deque
 
 import torch
 import torch.nn.functional as F  # noqa: N812
+from einops import rearrange
 from torch import Tensor, nn
 from transformers import AutoTokenizer
 
@@ -152,7 +153,6 @@ def resize_with_pad(img: Tensor, width: int, height: int, pad_value: int = -1) -
     # pad on left and top of image
     padded_img = F.pad(resized_img, (pad_width, 0, pad_height, 0), value=pad_value)
     return padded_img
-
 
 def pad_vector(vector: Tensor, new_dim: int) -> Tensor:
     """Pads the last dimension of a vector to a new size with zeros.
@@ -459,6 +459,7 @@ class PI0Policy(PreTrainedPolicy):
         # querying the policy.
         if len(self._action_queue) <= self.config.safety_buffer:
             actions = self.sample_actions(batch, noise=noise)
+            actions = rearrange(actions, "b c d -> c b d")
             self._action_queue.extend(actions)
         return self._action_queue.popleft()
 
@@ -471,7 +472,7 @@ class PI0Policy(PreTrainedPolicy):
             noise: Optional noise tensor.
 
         Returns:
-            The sampled actions tensor of shape (batch_size, action_dim).
+            The sampled actions tensor of shape (batch_size, action_chunk_length, action_dim).
         """
         batch = self.normalize_inputs(batch)
 
@@ -496,9 +497,6 @@ class PI0Policy(PreTrainedPolicy):
 
         actions = self.unnormalize_outputs({"actions": actions})["actions"]
 
-        # `self.model.forward` returns a (batch_size, n_action_steps, action_dim) tensor, but the queue
-        # effectively has shape (n_action_steps, batch_size, *), hence the transpose.
-        actions = actions.transpose(0, 1)
         return actions
 
     def forward(
