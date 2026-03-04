@@ -293,7 +293,8 @@ class PluginTactileAdapter(nn.Module):
         return flattened.reshape(batch_size, self.num_fingers, self.num_points, self.per_point_dim)
 
     def forward(self, tactile: Tensor) -> Tensor:
-        tactile = self._reshape_tactile(tactile).to(dtype=torch.float32)
+        proj_dtype = self.finger_summary_proj.weight.dtype
+        tactile = self._reshape_tactile(tactile).to(dtype=proj_dtype)
         batch_size = tactile.shape[0]
 
         finger_summary = tactile.mean(dim=2).reshape(batch_size, -1)
@@ -310,7 +311,7 @@ class PluginTactileAdapter(nn.Module):
         tactile_embedding = self.fusion_mlp(sinusoid)
 
         tactile_tokens = tactile_embedding[:, None, :].expand(-1, self.num_tokens, -1)
-        tactile_tokens = tactile_tokens + self.token_positional[None, :, :]
+        tactile_tokens = tactile_tokens + self.token_positional[None, :, :].to(dtype=tactile_tokens.dtype)
         return tactile_tokens
 
 

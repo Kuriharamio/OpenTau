@@ -70,6 +70,14 @@ class LoRALinear(nn.Module):
         lora_out = self.lora_B(self.lora_A(self.dropout(x)))
         return base_out + self.scaling * lora_out
 
+    @property
+    def weight(self) -> torch.nn.Parameter:
+        return self.base_layer.weight
+
+    @property
+    def bias(self) -> torch.nn.Parameter | None:
+        return self.base_layer.bias
+
 
 def _preferred_dtype():
     return torch.float32 if torch.onnx.is_in_onnx_export() else torch.bfloat16
@@ -321,8 +329,21 @@ class PaliGemmaWithExpertModel(PreTrainedModel):
 
     def _apply_lora_to_attention_projections(self) -> None:
         targets = set(self.config.lora_target_modules)
-        models = [self.paligemma.language_model.model.layers, self.gemma_expert.model.layers]
-        for layers in models:
+        paligemma_layers = getattr(self.paligemma.language_model, "layers", None)
+        if paligemma_layers is None and hasattr(self.paligemma.language_model, "model"):
+            paligemma_layers = getattr(self.paligemma.language_model.model, "layers", None)
+
+        gemma_layers = getattr(self.gemma_expert.model, "layers", None)
+        if gemma_layers is None and hasattr(self.gemma_expert.model, "model"):
+            gemma_layers = getattr(self.gemma_expert.model.model, "layers", None)
+
+        if paligemma_layers is None or gemma_layers is None:
+            raise AttributeError(
+                "Unable to locate transformer layers for LoRA injection. "
+                "Expected `.layers` or `.model.layers` in language/expert modules."
+            )
+
+        for layers in (paligemma_layers, gemma_layers):
             for layer in layers:
                 for projection_name in targets:
                     self._wrap_linear_with_lora(layer.self_attn, projection_name)
